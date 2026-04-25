@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import { writeTestDocument } from "@/services/firestore";
 
@@ -40,9 +41,12 @@ function Navbar() {
           <button className="hidden sm:block text-[13px] font-medium text-neutral-400 hover:text-white transition-colors duration-200">
             Sign In
           </button>
-          <button className="h-9 px-4 rounded bg-cyan-500 text-black text-[13px] font-semibold hover:bg-cyan-400 transition-colors duration-200 shadow-[0_0_20px_rgba(6,182,212,0.2)]">
-            Open App
-          </button>
+          <Link
+            href="/safe-route-planner"
+            className="h-9 px-4 rounded bg-cyan-500 text-black text-[13px] font-semibold hover:bg-cyan-400 transition-colors duration-200 shadow-[0_0_20px_rgba(6,182,212,0.2)] flex items-center justify-center"
+          >
+            Safe Route Planner
+          </Link>
         </div>
       </div>
     </header>
@@ -84,10 +88,13 @@ function Hero() {
 
         {/* CTA */}
         <div className="flex flex-col sm:flex-row items-center gap-4 w-full sm:w-auto">
-          <button className="w-full sm:w-auto h-11 px-8 rounded bg-cyan-500 text-black text-[14px] font-semibold hover:bg-cyan-400 transition-all duration-200 shadow-[0_0_20px_rgba(6,182,212,0.3)] flex items-center justify-center gap-2">
-            Launch Dashboard
+          <Link
+            href="/safe-route-planner"
+            className="w-full sm:w-auto h-11 px-8 rounded bg-cyan-500 text-black text-[14px] font-semibold hover:bg-cyan-400 transition-all duration-200 shadow-[0_0_20px_rgba(6,182,212,0.3)] flex items-center justify-center gap-2"
+          >
+            Launch Safe Route Planner
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
-          </button>
+          </Link>
           <button className="w-full sm:w-auto h-11 px-8 rounded border border-white/[0.08] bg-white/[0.02] text-white text-[14px] font-medium hover:bg-white/[0.06] transition-all duration-200 flex items-center justify-center">
             View Analytics
           </button>
