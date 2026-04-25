@@ -21,6 +21,18 @@ export type TrackedVehicle = {
   timestamp: Timestamp | null;
 };
 
+export type ThreatZoneInput = {
+  lat: number;
+  lng: number;
+  radius: number;
+  severity: string;
+};
+
+export type ThreatZoneRecord = ThreatZoneInput & {
+  id: string;
+  timestamp: Timestamp | null;
+};
+
 /**
  * Writes a test document to the `test` collection in Firestore.
  * Returns the new document ID on success.
@@ -94,6 +106,58 @@ export function subscribeToVehicle(
         routeId: typeof data.routeId === "string" ? data.routeId : "",
         timestamp: data.timestamp instanceof Timestamp ? data.timestamp : null,
       });
+    },
+    (error) => {
+      onError?.(error);
+    }
+  );
+}
+
+export async function createThreatZone({ lat, lng, radius, severity }: ThreatZoneInput) {
+  const threatZonesCollection = collection(db, "threatZones");
+
+  const docRef = await addDoc(threatZonesCollection, {
+    lat,
+    lng,
+    radius,
+    severity,
+    timestamp: serverTimestamp(),
+  });
+
+  return docRef.id;
+}
+
+export function subscribeToThreatZones(
+  onThreatZonesChange: (zones: ThreatZoneRecord[]) => void,
+  onError?: (error: Error) => void
+) {
+  return onSnapshot(
+    collection(db, "threatZones"),
+    (snapshot) => {
+      const zones = snapshot.docs
+        .map((threatZoneDoc) => {
+          const data = threatZoneDoc.data();
+
+          if (
+            typeof data.lat !== "number" ||
+            typeof data.lng !== "number" ||
+            typeof data.radius !== "number"
+          ) {
+            return null;
+          }
+
+          return {
+            id: threatZoneDoc.id,
+            lat: data.lat,
+            lng: data.lng,
+            radius: data.radius,
+            severity: typeof data.severity === "string" ? data.severity : "high",
+            timestamp: data.timestamp instanceof Timestamp ? data.timestamp : null,
+          };
+        })
+        .filter((zone): zone is ThreatZoneRecord => zone !== null);
+
+      onThreatZonesChange(zones);
     },
     (error) => {
       onError?.(error);
