@@ -9,7 +9,7 @@ import {
   Polyline,
   useJsApiLoader,
 } from "@react-google-maps/api";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ThreatZoneRecord,
   TrackedVehicle,
@@ -30,6 +30,14 @@ type ThreatZone = {
   center: google.maps.LatLngLiteral;
   radius: number;
   severity: string;
+};
+type CandidateRoute = {
+  result: google.maps.DirectionsResult;
+  path: google.maps.LatLngLiteral[];
+  waypoint: google.maps.LatLngLiteral;
+  durationSeconds: number;
+  distanceMeters: number;
+  score: number;
 };
 
 const defaultCenter = { lat: 20.5937, lng: 78.9629 };
@@ -56,6 +64,10 @@ const mapOptions: google.maps.MapOptions = {
 
 const vehicleMoveIntervalMs = 2500;
 const vehicleId = "truck-unit-1";
+const threatApproachBufferMeters = 3000;
+const threatClearanceBufferMeters = 900;
+const candidateBearings = [0, 45, 90, 135, 180, 225, 270, 315];
+const maxDecisionLogs = 14;
 const riskEvents: Record<RiskEvent, { label: string; increment: number }> = {
   door: { label: "Trigger Door Open", increment: 18 },
   stop: { label: "Trigger Stop", increment: 24 },
@@ -85,22 +97,47 @@ function getDistanceMeters(start: google.maps.LatLngLiteral, end: google.maps.La
 }
 
 function getAvoidanceWaypoint(
-  vehicleLocation: google.maps.LatLngLiteral,
-  zone: ThreatZone
+  zone: ThreatZone,
+  bearingDegrees: number
 ) {
-  const metersPerDegreeLat = 111320;
-  const metersPerDegreeLng = 111320 * Math.cos((zone.center.lat * Math.PI) / 180);
-  const deltaLatMeters = (vehicleLocation.lat - zone.center.lat) * metersPerDegreeLat;
-  const deltaLngMeters = (vehicleLocation.lng - zone.center.lng) * metersPerDegreeLng;
-  const distanceFromCenter = Math.max(Math.hypot(deltaLatMeters, deltaLngMeters), 1);
-  const detourDistance = zone.radius + 1200;
-  const normalizedLat = deltaLatMeters / distanceFromCenter;
-  const normalizedLng = deltaLngMeters / distanceFromCenter;
+  const earthRadiusMeters = 6371000;
+  const distance = zone.radius + threatClearanceBufferMeters;
+  const bearing = (bearingDegrees * Math.PI) / 180;
+  const lat1 = (zone.center.lat * Math.PI) / 180;
+  const lng1 = (zone.center.lng * Math.PI) / 180;
+  const angularDistance = distance / earthRadiusMeters;
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(angularDistance) +
+      Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing)
+  );
+  const lng2 =
+    lng1 +
+    Math.atan2(
+      Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+      Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2)
+    );
 
   return {
-    lat: zone.center.lat + (normalizedLat * detourDistance) / metersPerDegreeLat,
-    lng: zone.center.lng + (normalizedLng * detourDistance) / metersPerDegreeLng,
+    lat: (lat2 * 180) / Math.PI,
+    lng: (lng2 * 180) / Math.PI,
   };
+}
+
+function routeTouchesThreatZone(path: google.maps.LatLngLiteral[], zones: ThreatZone[], paddingMeters = 0) {
+  return path.some((point) =>
+    zones.some((zone) => getDistanceMeters(point, zone.center) <= zone.radius + paddingMeters)
+  );
+}
+
+function getRouteMetrics(result: google.maps.DirectionsResult) {
+  return result.routes[0]?.legs.reduce(
+    (totals, leg) => ({
+      durationSeconds:
+        totals.durationSeconds + (leg.duration_in_traffic?.value ?? leg.duration?.value ?? 0),
+      distanceMeters: totals.distanceMeters + (leg.distance?.value ?? 0),
+    }),
+    { durationSeconds: 0, distanceMeters: 0 }
+  ) ?? { durationSeconds: 0, distanceMeters: 0 };
 }
 
 function toThreatZone(record: ThreatZoneRecord): ThreatZone {
@@ -151,6 +188,7 @@ function SafeRoutePlanner() {
   const destinationAutocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
   const threatZoneCreatedRef = useRef(false);
   const reroutedThreatZonesRef = useRef<Set<string>>(new Set());
+  const rerouteInFlightRef = useRef(false);
   const [source, setSource] = useState("");
   const [destination, setDestination] = useState("");
   const [routeCoordinates, setRouteCoordinates] = useState<google.maps.LatLngLiteral[]>([]);
@@ -170,6 +208,10 @@ function SafeRoutePlanner() {
   const [threatZoneStatus, setThreatZoneStatus] = useState("");
   const [threatZoneError, setThreatZoneError] = useState("");
   const [rerouteStatus, setRerouteStatus] = useState("");
+  const [aiDecisionOpen, setAiDecisionOpen] = useState(false);
+  const [aiDecisionLogs, setAiDecisionLogs] = useState<string[]>([
+    "Route intelligence standing by. Plan a route to begin monitoring.",
+  ]);
 
   const routeMeta = useMemo(() => {
     const leg = directions?.routes[0]?.legs[0];
@@ -188,6 +230,23 @@ function SafeRoutePlanner() {
     ? threatZones.find(
         (zone) => getDistanceMeters(displayedVehiclePosition, zone.center) <= zone.radius
       )
+    : null;
+  const upcomingThreatZone = displayedVehiclePosition
+    ? threatZones
+        .map((zone) => ({
+          zone,
+          distance: getDistanceMeters(displayedVehiclePosition, zone.center),
+          routeConflict: routeTouchesThreatZone(
+            routeCoordinates.slice(Math.max(vehicleIndex, 0)),
+            [zone],
+            threatClearanceBufferMeters
+          ),
+        }))
+        .filter(
+          ({ zone, distance, routeConflict }) =>
+            routeConflict || distance <= zone.radius + threatApproachBufferMeters
+        )
+        .sort((a, b) => a.distance - b.distance)[0]?.zone ?? null
     : null;
   const lastSyncedAt = syncedVehicle?.timestamp?.toDate().toLocaleTimeString([], {
     hour: "2-digit",
@@ -243,6 +302,16 @@ function SafeRoutePlanner() {
       anchor: new google.maps.Point(21, 34),
     };
   }, [isLoaded]);
+
+  const addAiDecisionLog = useCallback((entry: string) => {
+    const timestamp = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+
+    setAiDecisionLogs((currentLogs) => [`${timestamp}  ${entry}`, ...currentLogs].slice(0, maxDecisionLogs));
+  }, []);
 
   useEffect(() => {
     const unsubscribe = subscribeToVehicle(
@@ -345,63 +414,125 @@ function SafeRoutePlanner() {
   }
 
   useEffect(() => {
-    if (!isLoaded || !activeThreatZone || !displayedVehiclePosition || !destination.trim()) {
+    if (
+      !isLoaded ||
+      !upcomingThreatZone ||
+      !displayedVehiclePosition ||
+      !destination.trim() ||
+      rerouteInFlightRef.current ||
+      reroutedThreatZonesRef.current.has(upcomingThreatZone.id)
+    ) {
       return;
     }
 
-    if (reroutedThreatZonesRef.current.has(activeThreatZone.id)) {
-      return;
-    }
-
-    reroutedThreatZonesRef.current.add(activeThreatZone.id);
-    setRerouteStatus("Generating alternate route");
+    const zoneToAvoid = upcomingThreatZone;
+    const vehicleLocation = displayedVehiclePosition;
+    rerouteInFlightRef.current = true;
+    reroutedThreatZonesRef.current.add(zoneToAvoid.id);
+    setRerouteStatus("Evaluating alternate corridors");
+    addAiDecisionLog(
+      `Threat ${zoneToAvoid.id.slice(0, 6)} detected ahead. Evaluating traffic-aware routes from live vehicle coordinates.`
+    );
 
     const service = new google.maps.DirectionsService();
-    const detourWaypoint = getAvoidanceWaypoint(displayedVehiclePosition, activeThreatZone);
+    const zonesToAvoid = threatZones.length ? threatZones : [zoneToAvoid];
 
-    service
-      .route({
-        origin: displayedVehiclePosition,
-        destination,
-        travelMode: google.maps.TravelMode.DRIVING,
-        provideRouteAlternatives: true,
-        waypoints: [
-          {
-            location: detourWaypoint,
-            stopover: false,
+    async function evaluateRoutes() {
+      const candidatePromises = candidateBearings.map(async (bearing) => {
+        const waypoint = getAvoidanceWaypoint(zoneToAvoid, bearing);
+        addAiDecisionLog(`Testing ${bearing}deg avoidance corridor outside ${Math.round(zoneToAvoid.radius)}m zone.`);
+
+        const result = await service.route({
+          origin: vehicleLocation,
+          destination,
+          travelMode: google.maps.TravelMode.DRIVING,
+          provideRouteAlternatives: true,
+          drivingOptions: {
+            departureTime: new Date(),
+            trafficModel: google.maps.TrafficModel.BEST_GUESS,
           },
-        ],
-      })
-      .then((result) => {
+          waypoints: [
+            {
+              location: waypoint,
+              stopover: false,
+            },
+          ],
+        });
+
         const path = result.routes[0]?.overview_path.map((point) => ({
           lat: point.lat(),
           lng: point.lng(),
-        }));
+        })) ?? [];
+        const metrics = getRouteMetrics(result);
+        const touchesRisk = routeTouchesThreatZone(path, zonesToAvoid, threatClearanceBufferMeters);
 
-        if (!path?.length) {
-          throw new Error("Directions API returned an empty alternate route.");
+        if (!path.length || touchesRisk) {
+          addAiDecisionLog(`Rejected ${bearing}deg corridor: route still intersects a high-risk radius.`);
+          return null;
         }
 
+        const score = metrics.durationSeconds + metrics.distanceMeters / 25;
+        addAiDecisionLog(
+          `Accepted ${bearing}deg corridor: ${Math.round(metrics.distanceMeters / 1000)}km, ${Math.round(
+            metrics.durationSeconds / 60
+          )}min traffic ETA.`
+        );
+
+        return {
+          result,
+          path,
+          waypoint,
+          durationSeconds: metrics.durationSeconds,
+          distanceMeters: metrics.distanceMeters,
+          score,
+        } satisfies CandidateRoute;
+      });
+
+      const candidates = (await Promise.allSettled(candidatePromises))
+        .flatMap((candidate) => (candidate.status === "fulfilled" && candidate.value ? [candidate.value] : []))
+        .sort((a, b) => a.score - b.score);
+
+      if (!candidates.length) {
+        throw new Error("No safe alternate route found outside current threat zones.");
+      }
+
+      return candidates[0];
+    }
+
+    evaluateRoutes()
+      .then((bestRoute) => {
         const nextRouteId = createRouteId();
         const bounds = new google.maps.LatLngBounds();
-        path.forEach((point) => bounds.extend(point));
+        bestRoute.path.forEach((point) => bounds.extend(point));
 
-        setDirections(result);
-        setRouteCoordinates(path);
+        setDirections(bestRoute.result);
+        setRouteCoordinates(bestRoute.path);
         setRouteId(nextRouteId);
-        setVehiclePosition(displayedVehiclePosition);
+        setVehiclePosition(bestRoute.path[0] ?? vehicleLocation);
         setVehicleIndex(0);
         setVehicleStatus("In transit");
         setStatus("success");
-        setMessage("Alternative route generated to avoid threat zone.");
-        setRerouteStatus("Alternative route active");
+        setMessage("Optimized alternate route selected.");
+        setRerouteStatus(
+          `Optimized route: ${Math.round(bestRoute.distanceMeters / 1000)}km / ${Math.round(
+            bestRoute.durationSeconds / 60
+          )}min`
+        );
+        addAiDecisionLog(
+          `Committed optimized safe route. Route avoids known zones and optimizes traffic ETA plus distance.`
+        );
         mapRef.current?.fitBounds(bounds, 72);
       })
       .catch((error) => {
-        reroutedThreatZonesRef.current.delete(activeThreatZone.id);
-        setRerouteStatus(error instanceof Error ? error.message : "Unable to generate alternate route.");
+        reroutedThreatZonesRef.current.delete(zoneToAvoid.id);
+        const errorMessage = error instanceof Error ? error.message : "Unable to generate alternate route.";
+        setRerouteStatus(errorMessage);
+        addAiDecisionLog(`Reroute failed: ${errorMessage}`);
+      })
+      .finally(() => {
+        rerouteInFlightRef.current = false;
       });
-  }, [activeThreatZone, destination, displayedVehiclePosition, isLoaded]);
+  }, [addAiDecisionLog, destination, displayedVehiclePosition, isLoaded, threatZones, upcomingThreatZone]);
 
   useEffect(() => {
     if (!routeCoordinates.length) {
@@ -475,6 +606,7 @@ function SafeRoutePlanner() {
     setStatus("loading");
     setMessage("");
     setRerouteStatus("");
+    setAiDecisionLogs(["Route intelligence initialized. Monitoring Firestore threat zones and traffic-aware alternatives."]);
     reroutedThreatZonesRef.current.clear();
     setVehiclePosition(null);
     setVehicleIndex(0);
@@ -706,6 +838,12 @@ function SafeRoutePlanner() {
             </button>
           </form>
 
+          {message && (
+            <p className={`mt-3 text-xs ${status === "error" ? "text-red-100" : "text-neutral-300"}`}>
+              {message}
+            </p>
+          )}
+
           <div className="mt-4 grid grid-cols-3 gap-2 text-center">
             <div className="rounded border border-white/10 bg-black/25 px-2 py-2">
               <p className="text-[11px] text-neutral-400">Distance</p>
@@ -718,22 +856,6 @@ function SafeRoutePlanner() {
             <div className="rounded border border-white/10 bg-black/25 px-2 py-2">
               <p className="text-[11px] text-neutral-400">Coords</p>
               <p className="mt-1 text-sm font-semibold text-white">{routeMeta.coordinateCount}</p>
-            </div>
-          </div>
-
-          <div className="mt-4 min-h-12 rounded border border-white/10 bg-black/30 p-3 text-xs leading-5">
-            <div className="flex items-start gap-2">
-              <span
-                className={`mt-1 h-2 w-2 shrink-0 rounded-full ${
-                  status === "success" ? "bg-emerald-300" : status === "error" ? "bg-red-300" : "bg-neutral-500"
-                }`}
-              />
-              <div className="min-w-0">
-                <p className={status === "error" ? "text-red-100" : "text-neutral-200"}>
-                  {message || "Choose source and destination to generate a route."}
-                </p>
-                {displayedRouteId && <p className="mt-1 break-all font-mono text-cyan-200">routeId: {displayedRouteId}</p>}
-              </div>
             </div>
           </div>
 
@@ -772,6 +894,49 @@ function SafeRoutePlanner() {
                 : threatZoneStatus || "Threat zone triggers above 60 risk."}
               {threatZoneError && <div className="mt-1 break-words text-red-200">{threatZoneError}</div>}
             </div>
+          </div>
+
+          <div className="mt-4 rounded border border-white/10 bg-black/30 p-3">
+            <button
+              type="button"
+              onClick={() => setAiDecisionOpen((isOpen) => !isOpen)}
+              className="flex w-full items-center justify-between gap-3 text-left"
+            >
+              <span>
+                <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200/80">
+                  AI Decision Center
+                </span>
+                <span className="mt-1 block text-sm font-semibold text-white">
+                  Dynamic routing intelligence
+                </span>
+              </span>
+              <span className="rounded border border-white/10 bg-white/[0.06] px-2 py-1 text-xs text-cyan-100">
+                {aiDecisionOpen ? "Hide" : "Open"}
+              </span>
+            </button>
+
+            {aiDecisionOpen && (
+              <div className="mt-3 space-y-3">
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <div className="rounded border border-white/10 bg-black/30 p-2">
+                    <p className="text-neutral-500">Route</p>
+                    <p className="mt-1 break-all font-mono text-cyan-200">{displayedRouteId || "Not assigned"}</p>
+                  </div>
+                  <div className="rounded border border-white/10 bg-black/30 p-2">
+                    <p className="text-neutral-500">Decision</p>
+                    <p className="mt-1 text-neutral-200">{rerouteStatus || "Monitoring"}</p>
+                  </div>
+                </div>
+
+                <div className="max-h-44 space-y-2 overflow-y-auto pr-1">
+                  {aiDecisionLogs.map((log, index) => (
+                    <div key={`${log}-${index}`} className="rounded border border-white/10 bg-black/30 p-2 text-xs leading-5 text-neutral-300">
+                      {log}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </section>
