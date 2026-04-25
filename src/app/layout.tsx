@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
+import { Inter } from "next/font/google";
 import "./globals.css";
+
+const inter = Inter({ subsets: ["latin"], display: 'swap' });
 
 export const metadata: Metadata = {
   title: "NavixAI — Real-Time Collaborative Threat Intelligence for Logistics",
@@ -29,7 +32,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="dark">
-      <body className="bg-amoled text-text-primary antialiased">{children}</body>
+      <body className={`${inter.className} bg-[#0A0A0A] text-[#F0F0F0] antialiased`}>{children}</body>
     </html>
   );
 }

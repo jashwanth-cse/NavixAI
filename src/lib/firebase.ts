@@ -13,6 +13,6 @@ const firebaseConfig = {
 // Prevent re-initialisation in Next.js hot-reload / client-side renders
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 
-const db = getFirestore(app);
+const db = getFirestore(app, "navix-ai");
 
 export { app, db };
