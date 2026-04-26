@@ -397,6 +397,9 @@ function SafeRoutePlanner() {
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceLanguage, setVoiceLanguage] = useState("en-US");
   const [availableVoiceLanguages, setAvailableVoiceLanguages] = useState<string[]>(["en-US"]);
+  const [plannerOpen, setPlannerOpen] = useState(true);
+  const [advisoryOpen, setAdvisoryOpen] = useState(true);
+  const [riskOpen, setRiskOpen] = useState(false);
   const [aiDecisionOpen, setAiDecisionOpen] = useState(false);
   const [aiDecisionLogs, setAiDecisionLogs] = useState<string[]>([
     "Route intelligence standing by. Plan a route to begin monitoring.",
@@ -1260,8 +1263,8 @@ function SafeRoutePlanner() {
         </section>
       )}
 
-      <section className="pointer-events-none absolute inset-x-0 top-0 z-10 px-4 pt-4 sm:inset-x-auto sm:left-5 sm:top-5 sm:w-[420px] sm:p-0">
-        <div className="pointer-events-auto rounded-2xl border border-white/60 bg-white/72 p-4 shadow-2xl shadow-slate-900/20 backdrop-blur-2xl sm:p-5">
+      <section className="pointer-events-none absolute inset-x-0 top-0 bottom-0 z-10 px-4 pt-4 pb-24 sm:inset-x-auto sm:left-5 sm:top-5 sm:bottom-5 sm:w-[420px] sm:p-0">
+        <div className="pointer-events-auto flex h-full max-h-full flex-col overflow-hidden rounded-2xl border border-white/60 bg-white/78 p-4 shadow-2xl shadow-slate-900/20 backdrop-blur-2xl sm:p-5">
           <div className="mb-5 flex items-center justify-between gap-4">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">NavixAI</p>
@@ -1275,225 +1278,278 @@ function SafeRoutePlanner() {
             </span>
           </div>
 
-          <form className="space-y-3" onSubmit={handleSubmit}>
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-medium text-slate-600">Source</span>
-              {isLoaded ? (
-                <Autocomplete
-                  onLoad={(autocomplete) => {
-                    sourceAutocompleteRef.current = autocomplete;
-                  }}
-                  onPlaceChanged={() => handlePlaceChanged("source")}
-                >
-                  <input
-                    value={source}
-                    onChange={(event) => setSource(event.target.value)}
-                    placeholder="Search pickup location"
-                    className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-400 focus:bg-white"
-                  />
-                </Autocomplete>
-              ) : (
-                <input
-                  disabled
-                  placeholder="Loading Places..."
-                  className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-400"
-                />
-              )}
-            </label>
-
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-medium text-slate-600">Destination</span>
-              {isLoaded ? (
-                <Autocomplete
-                  onLoad={(autocomplete) => {
-                    destinationAutocompleteRef.current = autocomplete;
-                  }}
-                  onPlaceChanged={() => handlePlaceChanged("destination")}
-                >
-                  <input
-                    value={destination}
-                    onChange={(event) => setDestination(event.target.value)}
-                    placeholder="Search dropoff location"
-                    className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-400 focus:bg-white"
-                  />
-                </Autocomplete>
-              ) : (
-                <input
-                  disabled
-                  placeholder="Loading Places..."
-                  className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-400"
-                />
-              )}
-            </label>
-
-            <button
-              type="submit"
-              disabled={!isLoaded || status === "loading"}
-              className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-sky-600 px-4 text-sm font-semibold text-white shadow-lg shadow-sky-950/20 transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
-            >
-              {status === "loading" ? (
-                <>
-                  <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
-                    <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
-                    <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
-                  </svg>
-                  Fetching route
-                </>
-              ) : (
-                <>
-                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M5 12h14" />
-                    <path d="m13 5 7 7-7 7" />
-                  </svg>
-                  Plan route
-                </>
-              )}
-            </button>
-          </form>
-
-          <button
-            type="button"
-            onClick={stopNavigation}
-            disabled={!navigationId && !routeCoordinates.length}
-            className="mt-3 flex h-10 w-full items-center justify-center rounded-xl border border-rose-200 bg-rose-50 px-4 text-sm font-semibold text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
-          >
-            Stop Navigation
-          </button>
-
-          {message && (
-            <p className={`mt-3 text-xs ${status === "error" ? "text-rose-600" : "text-slate-600"}`}>
-              {message}
-            </p>
-          )}
-
-          <div className="mt-4 grid grid-cols-3 gap-2 text-center">
-            <div className="rounded-xl border border-slate-200 bg-white/80 px-2 py-2">
-              <p className="text-[11px] text-slate-500">Distance</p>
-              <p className="mt-1 truncate text-sm font-semibold text-slate-900">{routeMeta.distance}</p>
-            </div>
-            <div className="rounded-xl border border-slate-200 bg-white/80 px-2 py-2">
-              <p className="text-[11px] text-slate-500">Duration</p>
-              <p className="mt-1 truncate text-sm font-semibold text-slate-900">{routeMeta.duration}</p>
-            </div>
-            <div className="rounded-xl border border-slate-200 bg-white/80 px-2 py-2">
-              <p className="text-[11px] text-slate-500">Coords</p>
-              <p className="mt-1 text-sm font-semibold text-slate-900">{routeMeta.coordinateCount}</p>
-            </div>
-          </div>
-
-          <div className="mt-4 rounded-2xl border border-slate-200 bg-white/80 p-3">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">Driver Advisory</p>
-                <p className="mt-1 text-sm font-semibold text-slate-900">Shared route intelligence</p>
-              </div>
-              <label className="flex items-center gap-2 text-xs text-slate-600">
-                <input
-                  type="checkbox"
-                  checked={voiceEnabled}
-                  onChange={(event) => setVoiceEnabled(event.target.checked)}
-                  className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                />
-                Voice
-              </label>
-            </div>
-            <p className="mt-3 text-sm leading-6 text-slate-700">{driverBriefing}</p>
-            {voiceEnabled && (
-              <select
-                value={voiceLanguage}
-                onChange={(event) => setVoiceLanguage(event.target.value)}
-                className="mt-3 h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-400"
+          <div className="flex-1 space-y-4 overflow-y-auto pr-1">
+            <div className="rounded-2xl border border-slate-200 bg-white/80 p-3">
+              <button
+                type="button"
+                onClick={() => setPlannerOpen((isOpen) => !isOpen)}
+                className="flex w-full items-center justify-between gap-3 text-left"
               >
-                {availableVoiceLanguages.map((language) => (
-                  <option key={language} value={language}>
-                    {language}
-                  </option>
-                ))}
-              </select>
-            )}
-            {incidentError && <p className="mt-2 text-xs text-rose-600">{incidentError}</p>}
-          </div>
-
-          <div className="mt-4 rounded-2xl border border-slate-200 bg-white/80 p-3">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">Risk</p>
-                <p className="mt-1 text-sm font-semibold text-slate-900">Event Monitor</p>
-              </div>
-              <span className={`rounded px-2 py-1 text-xs font-semibold ${riskColor}`}>{riskScore}/100</span>
-            </div>
-
-            <div className="h-2 overflow-hidden rounded-full bg-slate-200">
-              <div
-                className={`h-full rounded-full transition-all duration-300 ${riskTrackColor}`}
-                style={{ width: `${riskScore}%` }}
-              />
-            </div>
-
-            <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-              {(Object.keys(riskEvents) as RiskEvent[]).map((eventType) => (
-                <button
-                  key={eventType}
-                  type="button"
-                  onClick={() => {
-                    void triggerRiskEvent(eventType);
-                  }}
-                  className="min-h-9 rounded-xl border border-slate-200 bg-white px-2 py-2 text-xs font-medium text-slate-700 transition hover:border-sky-300 hover:bg-sky-50"
-                >
-                  {riskEvents[eventType].label}
-                </button>
-              ))}
-            </div>
-
-            <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-              {threatZone
-                ? `${threatZone.severity.toUpperCase()} zone: 2km radius`
-                : threatZoneStatus || "Threat zone triggers above 60 risk."}
-              {threatZoneError && <div className="mt-1 break-words text-rose-600">{threatZoneError}</div>}
-            </div>
-          </div>
-
-          <div className="mt-4 rounded-2xl border border-slate-200 bg-white/80 p-3">
-            <button
-              type="button"
-              onClick={() => setAiDecisionOpen((isOpen) => !isOpen)}
-              className="flex w-full items-center justify-between gap-3 text-left"
-            >
-              <span>
-                <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">
-                  AI Decision Center
+                <span>
+                  <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">
+                    Route Planner
+                  </span>
+                  <span className="mt-1 block text-sm font-semibold text-slate-900">
+                    Search and control navigation
+                  </span>
                 </span>
-                <span className="mt-1 block text-sm font-semibold text-slate-900">
-                  Dynamic routing intelligence
+                <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-sky-700">
+                  {plannerOpen ? "Hide" : "Open"}
                 </span>
-              </span>
-              <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-sky-700">
-                {aiDecisionOpen ? "Hide" : "Open"}
-              </span>
-            </button>
+              </button>
 
-            {aiDecisionOpen && (
-              <div className="mt-3 space-y-3">
-                <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-2">
-                    <p className="text-slate-500">Route</p>
-                    <p className="mt-1 break-all font-mono text-sky-700">{displayedRouteId || "Not assigned"}</p>
-                  </div>
-                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-2">
-                    <p className="text-slate-500">Decision</p>
-                    <p className="mt-1 text-slate-700">{rerouteStatus || "Monitoring"}</p>
-                  </div>
-                </div>
+              {plannerOpen && (
+                <div className="mt-3 space-y-4">
+                  <form className="space-y-3" onSubmit={handleSubmit}>
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-medium text-slate-600">Source</span>
+                      {isLoaded ? (
+                        <Autocomplete
+                          onLoad={(autocomplete) => {
+                            sourceAutocompleteRef.current = autocomplete;
+                          }}
+                          onPlaceChanged={() => handlePlaceChanged("source")}
+                        >
+                          <input
+                            value={source}
+                            onChange={(event) => setSource(event.target.value)}
+                            placeholder="Search pickup location"
+                            className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-400 focus:bg-white"
+                          />
+                        </Autocomplete>
+                      ) : (
+                        <input
+                          disabled
+                          placeholder="Loading Places..."
+                          className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-400"
+                        />
+                      )}
+                    </label>
 
-                <div className="max-h-44 space-y-2 overflow-y-auto pr-1">
-                  {aiDecisionLogs.map((log, index) => (
-                    <div key={`${log}-${index}`} className="rounded-xl border border-slate-200 bg-slate-50 p-2 text-xs leading-5 text-slate-600">
-                      {log}
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-medium text-slate-600">Destination</span>
+                      {isLoaded ? (
+                        <Autocomplete
+                          onLoad={(autocomplete) => {
+                            destinationAutocompleteRef.current = autocomplete;
+                          }}
+                          onPlaceChanged={() => handlePlaceChanged("destination")}
+                        >
+                          <input
+                            value={destination}
+                            onChange={(event) => setDestination(event.target.value)}
+                            placeholder="Search dropoff location"
+                            className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-400 focus:bg-white"
+                          />
+                        </Autocomplete>
+                      ) : (
+                        <input
+                          disabled
+                          placeholder="Loading Places..."
+                          className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-400"
+                        />
+                      )}
+                    </label>
+
+                    <button
+                      type="submit"
+                      disabled={!isLoaded || status === "loading"}
+                      className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-sky-600 px-4 text-sm font-semibold text-white shadow-lg shadow-sky-950/20 transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+                    >
+                      {status === "loading" ? (
+                        <>
+                          <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                            <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                            <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                          </svg>
+                          Fetching route
+                        </>
+                      ) : (
+                        <>
+                          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M5 12h14" />
+                            <path d="m13 5 7 7-7 7" />
+                          </svg>
+                          Plan route
+                        </>
+                      )}
+                    </button>
+                  </form>
+
+                  <button
+                    type="button"
+                    onClick={stopNavigation}
+                    disabled={!navigationId && !routeCoordinates.length}
+                    className="flex h-10 w-full items-center justify-center rounded-xl border border-rose-200 bg-rose-50 px-4 text-sm font-semibold text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+                  >
+                    Stop Navigation
+                  </button>
+
+                  {message && (
+                    <p className={`text-xs ${status === "error" ? "text-rose-600" : "text-slate-600"}`}>
+                      {message}
+                    </p>
+                  )}
+
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div className="rounded-xl border border-slate-200 bg-white px-2 py-2">
+                      <p className="text-[11px] text-slate-500">Distance</p>
+                      <p className="mt-1 truncate text-sm font-semibold text-slate-900">{routeMeta.distance}</p>
                     </div>
-                  ))}
+                    <div className="rounded-xl border border-slate-200 bg-white px-2 py-2">
+                      <p className="text-[11px] text-slate-500">Duration</p>
+                      <p className="mt-1 truncate text-sm font-semibold text-slate-900">{routeMeta.duration}</p>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-white px-2 py-2">
+                      <p className="text-[11px] text-slate-500">Coords</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">{routeMeta.coordinateCount}</p>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-white/80 p-3">
+              <button
+                type="button"
+                onClick={() => setAdvisoryOpen((isOpen) => !isOpen)}
+                className="flex w-full items-start justify-between gap-3 text-left"
+              >
+                <span>
+                  <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">Driver Advisory</span>
+                  <span className="mt-1 block text-sm font-semibold text-slate-900">Shared route intelligence</span>
+                </span>
+                <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-sky-700">
+                  {advisoryOpen ? "Hide" : "Open"}
+                </span>
+              </button>
+
+              {advisoryOpen && (
+                <div className="mt-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm leading-6 text-slate-700">{driverBriefing}</p>
+                    <label className="flex shrink-0 items-center gap-2 text-xs text-slate-600">
+                      <input
+                        type="checkbox"
+                        checked={voiceEnabled}
+                        onChange={(event) => setVoiceEnabled(event.target.checked)}
+                        className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                      />
+                      Voice
+                    </label>
+                  </div>
+                  {voiceEnabled && (
+                    <select
+                      value={voiceLanguage}
+                      onChange={(event) => setVoiceLanguage(event.target.value)}
+                      className="mt-3 h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-400"
+                    >
+                      {availableVoiceLanguages.map((language) => (
+                        <option key={language} value={language}>
+                          {language}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {incidentError && <p className="mt-2 text-xs text-rose-600">{incidentError}</p>}
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-white/80 p-3">
+              <button
+                type="button"
+                onClick={() => setRiskOpen((isOpen) => !isOpen)}
+                className="flex w-full items-center justify-between gap-3 text-left"
+              >
+                <span>
+                  <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">Risk</span>
+                  <span className="mt-1 block text-sm font-semibold text-slate-900">Event Monitor</span>
+                </span>
+                <div className="flex items-center gap-2">
+                  <span className={`rounded px-2 py-1 text-xs font-semibold ${riskColor}`}>{riskScore}/100</span>
+                  <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-sky-700">
+                    {riskOpen ? "Hide" : "Open"}
+                  </span>
+                </div>
+              </button>
+
+              {riskOpen && (
+                <div className="mt-3">
+                  <div className="h-2 overflow-hidden rounded-full bg-slate-200">
+                    <div
+                      className={`h-full rounded-full transition-all duration-300 ${riskTrackColor}`}
+                      style={{ width: `${riskScore}%` }}
+                    />
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    {(Object.keys(riskEvents) as RiskEvent[]).map((eventType) => (
+                      <button
+                        key={eventType}
+                        type="button"
+                        onClick={() => {
+                          void triggerRiskEvent(eventType);
+                        }}
+                        className="min-h-9 rounded-xl border border-slate-200 bg-white px-2 py-2 text-xs font-medium text-slate-700 transition hover:border-sky-300 hover:bg-sky-50"
+                      >
+                        {riskEvents[eventType].label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
+                    {threatZone
+                      ? `${threatZone.severity.toUpperCase()} zone: 2km radius`
+                      : threatZoneStatus || "Threat zone triggers above 60 risk."}
+                    {threatZoneError && <div className="mt-1 break-words text-rose-600">{threatZoneError}</div>}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-white/80 p-3">
+              <button
+                type="button"
+                onClick={() => setAiDecisionOpen((isOpen) => !isOpen)}
+                className="flex w-full items-center justify-between gap-3 text-left"
+              >
+                <span>
+                  <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">
+                    AI Decision Center
+                  </span>
+                  <span className="mt-1 block text-sm font-semibold text-slate-900">
+                    Dynamic routing intelligence
+                  </span>
+                </span>
+                <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-sky-700">
+                  {aiDecisionOpen ? "Hide" : "Open"}
+                </span>
+              </button>
+
+              {aiDecisionOpen && (
+                <div className="mt-3 space-y-3">
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-2">
+                      <p className="text-slate-500">Route</p>
+                      <p className="mt-1 break-all font-mono text-sky-700">{displayedRouteId || "Not assigned"}</p>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-2">
+                      <p className="text-slate-500">Decision</p>
+                      <p className="mt-1 text-slate-700">{rerouteStatus || "Monitoring"}</p>
+                    </div>
+                  </div>
+
+                  <div className="max-h-52 space-y-2 overflow-y-auto pr-1">
+                    {aiDecisionLogs.map((log, index) => (
+                      <div key={`${log}-${index}`} className="rounded-xl border border-slate-200 bg-slate-50 p-2 text-xs leading-5 text-slate-600">
+                        {log}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </section>
