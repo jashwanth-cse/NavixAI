@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   Autocomplete,
   Circle,
@@ -245,6 +246,22 @@ function getRouteKey(source: string, destination: string) {
   return `${source.trim().toLowerCase()}__${destination.trim().toLowerCase()}`;
 }
 
+function formatThreatLocationLabel(zone: ThreatZone) {
+  if (zone.routeKey && !zone.routeKey.includes("__")) {
+    return zone.routeKey;
+  }
+
+  return `${zone.center.lat.toFixed(4)}, ${zone.center.lng.toFixed(4)}`;
+}
+
+function formatThreatDecisionLabel(zone: ThreatZone) {
+  if (zone.routeKey) {
+    return zone.routeKey.replace(/__/g, " -> ");
+  }
+
+  return `lat ${zone.center.lat.toFixed(4)}, lng ${zone.center.lng.toFixed(4)}`;
+}
+
 function findClosestCoordinateIndex(
   path: google.maps.LatLngLiteral[],
   target: google.maps.LatLngLiteral | null
@@ -405,6 +422,7 @@ function SafeRoutePlanner() {
     "Route intelligence standing by. Plan a route to begin monitoring.",
   ]);
   const spokenIncidentIdsRef = useRef<Set<string>>(new Set());
+  const spokenThreatZoneIdsRef = useRef<Set<string>>(new Set());
 
   const routeMeta = useMemo(() => {
     return {
@@ -506,6 +524,31 @@ function SafeRoutePlanner() {
     setAiDecisionLogs((currentLogs) => [`${timestamp}  ${entry}`, ...currentLogs].slice(0, maxDecisionLogs));
   }, []);
 
+  const speakText = useCallback(
+    (text: string, speechKey: string) => {
+      if (!voiceEnabled || spokenThreatZoneIdsRef.current.has(speechKey)) {
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      const matchingVoice = window.speechSynthesis
+        ?.getVoices()
+        .find((voice) => voice.lang.toLowerCase().startsWith(voiceLanguage.toLowerCase()));
+
+      if (matchingVoice) {
+        utterance.voice = matchingVoice;
+        utterance.lang = matchingVoice.lang;
+      } else {
+        utterance.lang = voiceLanguage;
+      }
+
+      window.speechSynthesis?.cancel();
+      window.speechSynthesis?.speak(utterance);
+      spokenThreatZoneIdsRef.current.add(speechKey);
+    },
+    [voiceEnabled, voiceLanguage]
+  );
+
   const saveNavigationSnapshot = useCallback((snapshot: NavigationSnapshot) => {
     window.sessionStorage.setItem(navigationSessionStorageKey, snapshot.navigationId);
     window.sessionStorage.setItem(navigationStateStorageKey, JSON.stringify(snapshot));
@@ -513,7 +556,6 @@ function SafeRoutePlanner() {
 
   useEffect(() => {
     if (!relevantIncident) {
-      setDriverBriefing("No active advisories.");
       return;
     }
 
@@ -528,9 +570,14 @@ function SafeRoutePlanner() {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
+            kind: "incident",
             eventType: incident.eventType,
             sourceLabel: incident.sourceLabel,
             destinationLabel: incident.destinationLabel,
+            routeKey: incident.routeKey,
+            lat: incident.lat,
+            lng: incident.lng,
+            targetLanguage: voiceLanguage,
           }),
         });
         const payload = (await response.json()) as { narration?: string };
@@ -766,14 +813,16 @@ function SafeRoutePlanner() {
     const routeStart = routeCoordinates[0] ?? vehicleLocation;
     const startsInsideZone = getDistanceMeters(routeStart, zoneToAvoid.center) <= zoneToAvoid.radius;
     const rerouteOrigin = startsInsideZone && vehicleIndex <= 1 ? routeStart : vehicleLocation;
+    const threatDecisionLabel = formatThreatDecisionLabel(zoneToAvoid);
+    const threatLocationLabel = formatThreatLocationLabel(zoneToAvoid);
     rerouteInFlightRef.current = true;
     reroutedThreatZonesRef.current.add(zoneToAvoid.id);
     setRerouteStatus("Evaluating safer alternatives");
     setAiDecisionOpen(true);
     addAiDecisionLog(
       startsInsideZone && vehicleIndex <= 1
-        ? `Threat ${zoneToAvoid.id.slice(0, 6)} overlaps the route origin. Recomputing from source.`
-        : `Threat ${zoneToAvoid.id.slice(0, 6)} detected ahead. Recomputing from the live vehicle position.`
+        ? `High-risk zone at ${threatDecisionLabel} overlaps the route origin. Recomputing from source.`
+        : `High-risk zone near ${threatDecisionLabel} detected ahead. Recomputing from the live vehicle position.`
     );
 
     const zonesToAvoid = relevantThreatZones.length ? relevantThreatZones : [zoneToAvoid];
@@ -905,7 +954,7 @@ function SafeRoutePlanner() {
           )}min`
         );
         addAiDecisionLog(
-          `Committed a short traffic-aware reroute that stays outside the active 2km risk radius.`
+          `Committed a short traffic-aware reroute around ${threatDecisionLabel}, outside the active 2km risk radius.`
         );
         if (navigationId) {
           void updateVehicleNavigationRoute({
@@ -923,6 +972,40 @@ function SafeRoutePlanner() {
             vehiclePosition: nextVehiclePosition,
           });
         }
+        void fetch("/api/incident-briefing", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            kind: "reroute",
+            sourceLabel: source,
+            destinationLabel: destination,
+            routeKey: zoneToAvoid.routeKey,
+            severity: zoneToAvoid.severity,
+            radiusKm: Math.round(zoneToAvoid.radius / 1000),
+            lat: zoneToAvoid.center.lat,
+            lng: zoneToAvoid.center.lng,
+            locationLabel: threatLocationLabel,
+            targetLanguage: voiceLanguage,
+          }),
+        })
+          .then(async (response) => {
+            const payload = (await response.json()) as { narration?: string };
+            const rerouteBriefing =
+              payload.narration ||
+              `Rerouting near ${threatLocationLabel}. ${zoneToAvoid.severity} risk reported within ${Math.round(
+                zoneToAvoid.radius / 1000
+              )} kilometers ahead.`;
+            setDriverBriefing(rerouteBriefing);
+            addAiDecisionLog(`Driver reroute advisory: ${rerouteBriefing}`);
+            speakText(rerouteBriefing, zoneToAvoid.id);
+          })
+          .catch(() => {
+            const rerouteBriefing = `Rerouting near ${threatLocationLabel}. ${zoneToAvoid.severity} risk reported ahead.`;
+            setDriverBriefing(rerouteBriefing);
+            speakText(rerouteBriefing, zoneToAvoid.id);
+          });
         mapRef.current?.fitBounds(bounds, 72);
       })
       .catch((error) => {
@@ -943,9 +1026,11 @@ function SafeRoutePlanner() {
     relevantThreatZones,
     routeCoordinates,
     saveNavigationSnapshot,
+    speakText,
     source,
     upcomingThreatZone,
     vehicleIndex,
+    voiceLanguage,
   ]);
 
   useEffect(() => {
@@ -1065,6 +1150,7 @@ function SafeRoutePlanner() {
     threatZoneCreatedRef.current = false;
     reroutedThreatZonesRef.current.clear();
     spokenIncidentIdsRef.current.clear();
+    spokenThreatZoneIdsRef.current.clear();
     window.speechSynthesis?.cancel();
     setStatus("idle");
     setMessage("Navigation stopped.");
@@ -1113,6 +1199,7 @@ function SafeRoutePlanner() {
     setIncidentError("");
     threatZoneCreatedRef.current = false;
     spokenIncidentIdsRef.current.clear();
+    spokenThreatZoneIdsRef.current.clear();
     setRiskScore(0);
     setThreatZone(null);
     setAiDecisionLogs(["Route intelligence initialized. Monitoring Firestore threat zones and traffic-aware alternatives."]);
@@ -1266,9 +1353,17 @@ function SafeRoutePlanner() {
       <section className="pointer-events-none absolute inset-x-0 top-0 bottom-0 z-10 px-4 pt-4 pb-24 sm:inset-x-auto sm:left-5 sm:top-5 sm:bottom-5 sm:w-[420px] sm:p-0">
         <div className="pointer-events-auto flex h-full max-h-full flex-col overflow-hidden rounded-2xl border border-white/60 bg-white/78 p-4 shadow-2xl shadow-slate-900/20 backdrop-blur-2xl sm:p-5">
           <div className="mb-5 flex items-center justify-between gap-4">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">NavixAI</p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-900">Safe Route Planner</h1>
+            <div className="flex items-start gap-3">
+              <Link
+                href="/"
+                className="inline-flex h-10 items-center justify-center rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:border-sky-300 hover:text-sky-700"
+              >
+                Home
+              </Link>
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">NavixAI</p>
+                <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-900">Safe Route Planner</h1>
+              </div>
             </div>
             <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-sky-200 bg-sky-50 text-sky-700">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
