@@ -2,8 +2,12 @@ import {
   Timestamp,
   addDoc,
   collection,
+  deleteDoc,
   doc,
+  limit,
   onSnapshot,
+  orderBy,
+  query,
   serverTimestamp,
   setDoc,
 } from "firebase/firestore";
@@ -16,9 +20,8 @@ export type VehicleLocation = {
 
 export type TrackedVehicle = {
   vehicleId: string;
-  location: VehicleLocation;
-  routeId: string;
-  timestamp: Timestamp | null;
+  lat: number;
+  lng: number;
 };
 
 export type ThreatZoneInput = {
@@ -26,9 +29,28 @@ export type ThreatZoneInput = {
   lng: number;
   radius: number;
   severity: string;
+  sourceVehicleId?: string;
+  routeKey?: string;
 };
 
 export type ThreatZoneRecord = ThreatZoneInput & {
+  id: string;
+  timestamp: Timestamp | null;
+};
+
+export type IncidentEventType = "door" | "stop" | "deviation";
+
+export type IncidentMessageInput = {
+  sourceVehicleId: string;
+  routeKey: string;
+  sourceLabel: string;
+  destinationLabel: string;
+  eventType: IncidentEventType;
+  lat: number;
+  lng: number;
+};
+
+export type IncidentMessageRecord = IncidentMessageInput & {
   id: string;
   timestamp: Timestamp | null;
 };
@@ -58,25 +80,55 @@ export async function writeTestDocument(): Promise<string> {
   return docRef.id;
 }
 
-export async function updateVehicleTracking({
+export async function updateVehicleLiveLocation({
   vehicleId,
   location,
-  routeId,
 }: {
   vehicleId: string;
   location: VehicleLocation;
-  routeId: string;
 }) {
   await setDoc(
     doc(db, "vehicles", vehicleId),
     {
-      vehicleId,
-      location,
-      routeId,
-      timestamp: serverTimestamp(),
+      lat: location.lat,
+      lng: location.lng,
     },
     { merge: true }
   );
+}
+
+export async function createVehicleNavigation({
+  vehicleId,
+  location,
+}: {
+  vehicleId: string;
+  location: VehicleLocation;
+}) {
+  await setDoc(doc(db, "vehicles", vehicleId), {
+    lat: location.lat,
+    lng: location.lng,
+  });
+}
+
+export async function updateVehicleNavigationRoute({
+  vehicleId,
+  location,
+}: {
+  vehicleId: string;
+  location: VehicleLocation;
+}) {
+  await setDoc(
+    doc(db, "vehicles", vehicleId),
+    {
+      lat: location.lat,
+      lng: location.lng,
+    },
+    { merge: true }
+  );
+}
+
+export async function deleteVehicleNavigation(vehicleId: string) {
+  await deleteDoc(doc(db, "vehicles", vehicleId));
 }
 
 export function subscribeToVehicle(
@@ -93,18 +145,18 @@ export function subscribeToVehicle(
       }
 
       const data = snapshot.data();
-      const location = data.location as VehicleLocation | undefined;
+      const lat = typeof data.lat === "number" ? data.lat : data.location?.lat;
+      const lng = typeof data.lng === "number" ? data.lng : data.location?.lng;
 
-      if (!location || typeof location.lat !== "number" || typeof location.lng !== "number") {
+      if (typeof lat !== "number" || typeof lng !== "number") {
         onVehicleChange(null);
         return;
       }
 
       onVehicleChange({
         vehicleId: typeof data.vehicleId === "string" ? data.vehicleId : vehicleId,
-        location,
-        routeId: typeof data.routeId === "string" ? data.routeId : "",
-        timestamp: data.timestamp instanceof Timestamp ? data.timestamp : null,
+        lat,
+        lng,
       });
     },
     (error) => {
@@ -113,7 +165,14 @@ export function subscribeToVehicle(
   );
 }
 
-export async function createThreatZone({ lat, lng, radius, severity }: ThreatZoneInput) {
+export async function createThreatZone({
+  lat,
+  lng,
+  radius,
+  severity,
+  sourceVehicleId,
+  routeKey,
+}: ThreatZoneInput) {
   const threatZonesCollection = collection(db, "threatZones");
 
   const docRef = await addDoc(threatZonesCollection, {
@@ -121,6 +180,8 @@ export async function createThreatZone({ lat, lng, radius, severity }: ThreatZon
     lng,
     radius,
     severity,
+    sourceVehicleId: sourceVehicleId ?? null,
+    routeKey: routeKey ?? null,
     timestamp: serverTimestamp(),
   });
 
@@ -152,12 +213,86 @@ export function subscribeToThreatZones(
             lng: data.lng,
             radius: data.radius,
             severity: typeof data.severity === "string" ? data.severity : "high",
+            ...(typeof data.sourceVehicleId === "string"
+              ? { sourceVehicleId: data.sourceVehicleId }
+              : {}),
+            ...(typeof data.routeKey === "string" ? { routeKey: data.routeKey } : {}),
             timestamp: data.timestamp instanceof Timestamp ? data.timestamp : null,
           };
         })
         .filter((zone): zone is ThreatZoneRecord => zone !== null);
 
       onThreatZonesChange(zones);
+    },
+    (error) => {
+      onError?.(error);
+    }
+  );
+}
+
+export async function createIncidentMessage({
+  sourceVehicleId,
+  routeKey,
+  sourceLabel,
+  destinationLabel,
+  eventType,
+  lat,
+  lng,
+}: IncidentMessageInput) {
+  const incidentMessagesCollection = collection(db, "incidentMessages");
+
+  const docRef = await addDoc(incidentMessagesCollection, {
+    sourceVehicleId,
+    routeKey,
+    sourceLabel,
+    destinationLabel,
+    eventType,
+    lat,
+    lng,
+    timestamp: serverTimestamp(),
+  });
+
+  return docRef.id;
+}
+
+export function subscribeToIncidentMessages(
+  onIncidentMessagesChange: (messages: IncidentMessageRecord[]) => void,
+  onError?: (error: Error) => void
+) {
+  return onSnapshot(
+    query(collection(db, "incidentMessages"), orderBy("timestamp", "desc"), limit(30)),
+    (snapshot) => {
+      const messages = snapshot.docs
+        .map((incidentMessageDoc) => {
+          const data = incidentMessageDoc.data();
+
+          if (
+            typeof data.sourceVehicleId !== "string" ||
+            typeof data.routeKey !== "string" ||
+            typeof data.sourceLabel !== "string" ||
+            typeof data.destinationLabel !== "string" ||
+            typeof data.eventType !== "string" ||
+            typeof data.lat !== "number" ||
+            typeof data.lng !== "number"
+          ) {
+            return null;
+          }
+
+          return {
+            id: incidentMessageDoc.id,
+            sourceVehicleId: data.sourceVehicleId,
+            routeKey: data.routeKey,
+            sourceLabel: data.sourceLabel,
+            destinationLabel: data.destinationLabel,
+            eventType: data.eventType as IncidentEventType,
+            lat: data.lat,
+            lng: data.lng,
+            timestamp: data.timestamp instanceof Timestamp ? data.timestamp : null,
+          };
+        })
+        .filter((message): message is IncidentMessageRecord => message !== null);
+
+      onIncidentMessagesChange(messages);
     },
     (error) => {
       onError?.(error);
