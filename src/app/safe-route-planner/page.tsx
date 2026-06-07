@@ -89,6 +89,7 @@ const vehicleMoveIntervalMs = 850;
 const vehicleLiveLocationSyncMs = 5000;
 const navigationSessionStorageKey = "navix-active-navigation-id";
 const navigationStateStorageKey = "navix-active-navigation-state";
+const voiceSettingsStorageKey = "navix-voice-settings";
 const threatApproachBufferMeters = 0;
 const avoidanceBufferMeters = 250;
 const candidateBearings = [0, 45, 90, 135, 180, 225, 270, 315];
@@ -260,6 +261,69 @@ function formatThreatDecisionLabel(zone: ThreatZone) {
   }
 
   return `lat ${zone.center.lat.toFixed(4)}, lng ${zone.center.lng.toFixed(4)}`;
+}
+
+function getPrimaryLanguageCode(locale: string) {
+  return locale.trim().toLowerCase().split("-")[0] || "en";
+}
+
+function getVoiceLanguageLabel(locale: string) {
+  const languageCode = getPrimaryLanguageCode(locale);
+
+  switch (languageCode) {
+    case "ta":
+      return "Tamil";
+    case "hi":
+      return "Hindi";
+    case "te":
+      return "Telugu";
+    case "ml":
+      return "Malayalam";
+    case "kn":
+      return "Kannada";
+    case "mr":
+      return "Marathi";
+    case "bn":
+      return "Bengali";
+    case "gu":
+      return "Gujarati";
+    case "pa":
+      return "Punjabi";
+    case "ur":
+      return "Urdu";
+    case "es":
+      return "Spanish";
+    case "fr":
+      return "French";
+    case "de":
+      return "German";
+    case "it":
+      return "Italian";
+    case "pt":
+      return "Portuguese";
+    case "ja":
+      return "Japanese";
+    case "ko":
+      return "Korean";
+    case "zh":
+      return "Chinese";
+    case "ar":
+      return "Arabic";
+    default:
+      return "English";
+  }
+}
+
+function findMatchingVoice(voices: SpeechSynthesisVoice[], locale: string) {
+  const normalizedLocale = locale.trim().toLowerCase();
+  const primaryLanguageCode = getPrimaryLanguageCode(locale);
+
+  return (
+    voices.find((voice) => voice.lang.toLowerCase() === normalizedLocale) ||
+    voices.find((voice) => voice.lang.toLowerCase().startsWith(normalizedLocale)) ||
+    voices.find((voice) => getPrimaryLanguageCode(voice.lang) === primaryLanguageCode) ||
+    null
+  );
 }
 
 function findClosestCoordinateIndex(
@@ -531,15 +595,14 @@ function SafeRoutePlanner() {
       }
 
       const utterance = new SpeechSynthesisUtterance(text);
-      const matchingVoice = window.speechSynthesis
-        ?.getVoices()
-        .find((voice) => voice.lang.toLowerCase().startsWith(voiceLanguage.toLowerCase()));
+      const availableVoices = window.speechSynthesis?.getVoices() ?? [];
+      const matchingVoice = findMatchingVoice(availableVoices, voiceLanguage);
 
       if (matchingVoice) {
         utterance.voice = matchingVoice;
         utterance.lang = matchingVoice.lang;
       } else {
-        utterance.lang = voiceLanguage;
+        utterance.lang = getPrimaryLanguageCode(voiceLanguage);
       }
 
       window.speechSynthesis?.cancel();
@@ -596,15 +659,14 @@ function SafeRoutePlanner() {
         }
 
         const utterance = new SpeechSynthesisUtterance(nextBriefing);
-        const matchingVoice = window.speechSynthesis
-          ?.getVoices()
-          .find((voice) => voice.lang.toLowerCase().startsWith(voiceLanguage.toLowerCase()));
+        const availableVoices = window.speechSynthesis?.getVoices() ?? [];
+        const matchingVoice = findMatchingVoice(availableVoices, voiceLanguage);
 
         if (matchingVoice) {
           utterance.voice = matchingVoice;
           utterance.lang = matchingVoice.lang;
         } else {
-          utterance.lang = voiceLanguage;
+          utterance.lang = getPrimaryLanguageCode(voiceLanguage);
         }
 
         window.speechSynthesis?.cancel();
@@ -629,6 +691,41 @@ function SafeRoutePlanner() {
       window.speechSynthesis?.cancel();
     }
   }, [voiceEnabled]);
+
+  useEffect(() => {
+    try {
+      const rawVoiceSettings = window.localStorage.getItem(voiceSettingsStorageKey);
+
+      if (!rawVoiceSettings) {
+        return;
+      }
+
+      const parsedVoiceSettings = JSON.parse(rawVoiceSettings) as {
+        enabled?: boolean;
+        language?: string;
+      };
+
+      if (typeof parsedVoiceSettings.enabled === "boolean") {
+        setVoiceEnabled(parsedVoiceSettings.enabled);
+      }
+
+      if (typeof parsedVoiceSettings.language === "string" && parsedVoiceSettings.language.trim()) {
+        setVoiceLanguage(parsedVoiceSettings.language);
+      }
+    } catch {
+      window.localStorage.removeItem(voiceSettingsStorageKey);
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      voiceSettingsStorageKey,
+      JSON.stringify({
+        enabled: voiceEnabled,
+        language: voiceLanguage,
+      })
+    );
+  }, [voiceEnabled, voiceLanguage]);
 
   useEffect(() => {
     const storedNavigationId = window.sessionStorage.getItem(navigationSessionStorageKey);
@@ -688,14 +785,32 @@ function SafeRoutePlanner() {
   useEffect(() => {
     const loadVoices = () => {
       const voices = window.speechSynthesis?.getVoices() ?? [];
-      const nextLanguages = Array.from(
-        new Set(voices.map((voice) => voice.lang).filter((lang) => Boolean(lang)))
-      );
+      const uniqueLanguagesByCode = new Map<string, string>();
+
+      voices.forEach((voice) => {
+        if (!voice.lang) {
+          return;
+        }
+
+        const languageCode = getPrimaryLanguageCode(voice.lang);
+
+        if (!uniqueLanguagesByCode.has(languageCode)) {
+          uniqueLanguagesByCode.set(languageCode, voice.lang);
+        }
+      });
+
+      const nextLanguages = Array.from(uniqueLanguagesByCode.values());
 
       if (nextLanguages.length) {
         setAvailableVoiceLanguages(nextLanguages);
         setVoiceLanguage((currentLanguage) =>
-          nextLanguages.includes(currentLanguage) ? currentLanguage : nextLanguages[0]
+          nextLanguages.some(
+            (language) =>
+              language.toLowerCase() === currentLanguage.toLowerCase() ||
+              getPrimaryLanguageCode(language) === getPrimaryLanguageCode(currentLanguage)
+          )
+            ? currentLanguage
+            : nextLanguages[0]
         );
       }
     };
@@ -1541,7 +1656,7 @@ function SafeRoutePlanner() {
                     >
                       {availableVoiceLanguages.map((language) => (
                         <option key={language} value={language}>
-                          {language}
+                          {getVoiceLanguageLabel(language)}
                         </option>
                       ))}
                     </select>

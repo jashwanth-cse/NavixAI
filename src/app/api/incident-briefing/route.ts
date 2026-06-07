@@ -14,6 +14,15 @@ type IncidentBriefingRequest = {
   targetLanguage?: string;
 };
 
+function decodeHtmlEntities(text: string) {
+  return text
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
 function getTargetLanguageCode(targetLanguage?: string) {
   const locale = (targetLanguage || "en-US").trim();
   const [languageCode] = locale.split("-");
@@ -51,6 +60,49 @@ function buildFallbackNarration({
   }
 }
 
+async function generateGeminiText({
+  apiKey,
+  prompt,
+}: {
+  apiKey: string;
+  prompt: string;
+}) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [{ text: prompt }],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: 80,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    return "";
+  }
+
+  const result = (await response.json()) as {
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{ text?: string }>;
+      };
+    }>;
+  };
+
+  return result.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
+}
+
 export async function POST(request: NextRequest) {
   const payload = (await request.json()) as IncidentBriefingRequest;
   const apiKey = process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY;
@@ -83,48 +135,38 @@ export async function POST(request: NextRequest) {
   ].join("\n");
 
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [{ text: prompt }],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 60,
-          },
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      return NextResponse.json({ narration: buildFallbackNarration(payload), source: "fallback" });
-    }
-
-    const result = (await response.json()) as {
-      candidates?: Array<{
-        content?: {
-          parts?: Array<{ text?: string }>;
-        };
-      }>;
-    };
-    const englishNarration = result.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    const englishNarration = await generateGeminiText({ apiKey, prompt });
 
     if (!englishNarration) {
       return NextResponse.json({ narration: buildFallbackNarration(payload), source: "fallback" });
     }
 
-    if (targetLanguageCode === "en" || !translateApiKey) {
+    if (targetLanguageCode === "en") {
       return NextResponse.json({
         narration: englishNarration,
         source: targetLanguageCode === "en" ? "gemini" : "gemini-fallback-language",
+      });
+    }
+
+    if (targetLanguageCode === "ta") {
+      const tamilPrompt = [
+        "Translate this driver navigation advisory into natural spoken Tamil.",
+        "Keep it concise and suitable for in-cab voice guidance.",
+        "Return only Tamil script.",
+        `English advisory: ${englishNarration}`,
+      ].join("\n");
+      const tamilNarration = await generateGeminiText({ apiKey, prompt: tamilPrompt });
+
+      return NextResponse.json({
+        narration: tamilNarration || englishNarration,
+        source: tamilNarration ? "gemini-tamil" : "gemini-english",
+      });
+    }
+
+    if (!translateApiKey) {
+      return NextResponse.json({
+        narration: englishNarration,
+        source: "google-translate-key-missing",
       });
     }
 
@@ -140,12 +182,13 @@ export async function POST(request: NextRequest) {
           target: targetLanguageCode,
           format: "text",
           source: "en",
+          model: "nmt",
         }),
       }
     );
 
     if (!translationResponse.ok) {
-      return NextResponse.json({ narration: englishNarration, source: "gemini-english" });
+      return NextResponse.json({ narration: englishNarration, source: "google-translate-failed" });
     }
 
     const translationPayload = (await translationResponse.json()) as {
@@ -156,10 +199,11 @@ export async function POST(request: NextRequest) {
       };
     };
     const translatedNarration = translationPayload.data?.translations?.[0]?.translatedText?.trim();
+    const decodedNarration = translatedNarration ? decodeHtmlEntities(translatedNarration) : "";
 
     return NextResponse.json({
-      narration: translatedNarration || englishNarration,
-      source: translatedNarration ? "gemini-google-translate" : "gemini-english",
+      narration: decodedNarration || englishNarration,
+      source: decodedNarration ? "gemini-google-translate" : "gemini-english",
     });
   } catch {
     return NextResponse.json({ narration: buildFallbackNarration(payload), source: "fallback" });
