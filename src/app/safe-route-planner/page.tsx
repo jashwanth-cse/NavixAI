@@ -35,6 +35,7 @@ type ThreatZone = {
   center: google.maps.LatLngLiteral;
   radius: number;
   severity: string;
+  confidence: number;
   sourceVehicleId?: string;
   routeKey?: string;
 };
@@ -95,6 +96,7 @@ const avoidanceBufferMeters = 250;
 const candidateBearings = [0, 45, 90, 135, 180, 225, 270, 315];
 const maxDecisionLogs = 14;
 const routeFields = ["path", "durationMillis", "distanceMeters", "localizedValues"];
+const defaultThreatConfidence = 35;
 const riskEvents: Record<RiskEvent, { label: string; increment: number }> = {
   door: { label: "Trigger Door Open", increment: 18 },
   stop: { label: "Trigger Stop", increment: 24 },
@@ -405,6 +407,7 @@ function toThreatZone(record: ThreatZoneRecord): ThreatZone {
     center: { lat: record.lat, lng: record.lng },
     radius: record.radius,
     severity: record.severity,
+    confidence: record.confidence ?? defaultThreatConfidence,
     sourceVehicleId: record.sourceVehicleId,
     routeKey: record.routeKey,
   };
@@ -861,6 +864,7 @@ function SafeRoutePlanner() {
           center: zoneCenter,
           radius: 2000,
           severity,
+          confidence: defaultThreatConfidence,
           sourceVehicleId: navigationId || undefined,
           routeKey: routeKey || undefined,
         };
@@ -1459,6 +1463,7 @@ function SafeRoutePlanner() {
                 <p className="mt-1 text-xs text-red-100/80">
                   {activeThreatZone.severity.toUpperCase()} threat within {Math.round(activeThreatZone.radius / 1000)}km radius
                 </p>
+                <p className="mt-1 text-xs text-red-100/80">Confidence: {activeThreatZone.confidence}%</p>
               </div>
             </div>
           </div>
@@ -1709,9 +1714,14 @@ function SafeRoutePlanner() {
                   </div>
 
                   <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                    {threatZone
-                      ? `${threatZone.severity.toUpperCase()} zone: 2km radius`
-                      : threatZoneStatus || "Threat zone triggers above 60 risk."}
+                    {threatZone ? (
+                      <>
+                        <div>{threatZone.severity.toUpperCase()} zone: 2km radius</div>
+                        <div className="mt-1">Confidence: {threatZone.confidence}%</div>
+                      </>
+                    ) : (
+                      threatZoneStatus || "Threat zone triggers above 60 risk."
+                    )}
                     {threatZoneError && <div className="mt-1 break-words text-rose-600">{threatZoneError}</div>}
                   </div>
                 </div>

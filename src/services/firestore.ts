@@ -13,6 +13,8 @@ import {
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 
+const defaultThreatConfidence = 35;
+
 export type VehicleLocation = {
   lat: number;
   lng: number;
@@ -29,12 +31,14 @@ export type ThreatZoneInput = {
   lng: number;
   radius: number;
   severity: string;
+  confidence?: number;
   sourceVehicleId?: string;
   routeKey?: string;
 };
 
-export type ThreatZoneRecord = ThreatZoneInput & {
+export type ThreatZoneRecord = Omit<ThreatZoneInput, "confidence"> & {
   id: string;
+  confidence: number;
   timestamp: Timestamp | null;
 };
 
@@ -170,6 +174,7 @@ export async function createThreatZone({
   lng,
   radius,
   severity,
+  confidence,
   sourceVehicleId,
   routeKey,
 }: ThreatZoneInput) {
@@ -180,6 +185,7 @@ export async function createThreatZone({
     lng,
     radius,
     severity,
+    confidence: confidence ?? defaultThreatConfidence,
     sourceVehicleId: sourceVehicleId ?? null,
     routeKey: routeKey ?? null,
     timestamp: serverTimestamp(),
@@ -213,6 +219,7 @@ export function subscribeToThreatZones(
             lng: data.lng,
             radius: data.radius,
             severity: typeof data.severity === "string" ? data.severity : "high",
+            confidence: typeof data.confidence === "number" ? data.confidence : defaultThreatConfidence,
             ...(typeof data.sourceVehicleId === "string"
               ? { sourceVehicleId: data.sourceVehicleId }
               : {}),
