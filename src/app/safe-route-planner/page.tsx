@@ -265,6 +265,27 @@ function formatThreatDecisionLabel(zone: ThreatZone) {
   return `lat ${zone.center.lat.toFixed(4)}, lng ${zone.center.lng.toFixed(4)}`;
 }
 
+function getConfidenceLabel(confidence: number) {
+  if (confidence <= 40) {
+    return {
+      label: "Low Confidence",
+      className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    };
+  }
+
+  if (confidence <= 70) {
+    return {
+      label: "Medium Confidence",
+      className: "border-amber-200 bg-amber-50 text-amber-700",
+    };
+  }
+
+  return {
+    label: "High Confidence",
+    className: "border-rose-200 bg-rose-50 text-rose-700",
+  };
+}
+
 function getPrimaryLanguageCode(locale: string) {
   return locale.trim().toLowerCase().split("-")[0] || "en";
 }
@@ -519,6 +540,7 @@ function SafeRoutePlanner() {
         (zone) => getDistanceMeters(displayedVehiclePosition, zone.center) <= zone.radius
       )
     : null;
+  const activeThreatConfidence = activeThreatZone ? getConfidenceLabel(activeThreatZone.confidence) : null;
   const upcomingThreatZone = displayedVehiclePosition
     ? relevantThreatZones
         .map((zone) => ({
@@ -532,6 +554,7 @@ function SafeRoutePlanner() {
         .filter(({ zone, distance, routeConflict }) => routeConflict || distance <= zone.radius + threatApproachBufferMeters)
         .sort((a, b) => a.distance - b.distance)[0]?.zone ?? null
     : null;
+  const currentThreatConfidence = threatZone ? getConfidenceLabel(threatZone.confidence) : null;
   const riskColor =
     riskScore >= 70
       ? "bg-rose-100 text-rose-700"
@@ -1449,9 +1472,9 @@ function SafeRoutePlanner() {
 
       {activeThreatZone && (
         <section className="pointer-events-none absolute inset-x-0 top-[27rem] z-20 px-4 sm:inset-x-auto sm:left-5 sm:top-[430px] sm:w-[420px] sm:p-0">
-          <div className="animate-pulse rounded-lg border border-red-300/50 bg-red-500/20 p-4 shadow-2xl shadow-red-950/40 backdrop-blur-2xl">
+          <div className="rounded-lg border border-red-200 bg-white/95 p-4 shadow-2xl shadow-slate-900/25 backdrop-blur-2xl">
             <div className="flex items-center gap-3">
-              <span className="flex h-10 w-10 items-center justify-center rounded border border-red-200/40 bg-red-300/20 text-red-100">
+              <span className="flex h-10 w-10 items-center justify-center rounded border border-red-200 bg-red-50 text-red-600">
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
                   <path d="M12 9v4" />
@@ -1459,11 +1482,16 @@ function SafeRoutePlanner() {
                 </svg>
               </span>
               <div>
-                <p className="text-sm font-semibold text-red-50">High Risk Zone Ahead</p>
-                <p className="mt-1 text-xs text-red-100/80">
+                <p className="text-sm font-semibold text-slate-900">High Risk Zone Ahead</p>
+                <p className="mt-1 text-xs text-slate-600">
                   {activeThreatZone.severity.toUpperCase()} threat within {Math.round(activeThreatZone.radius / 1000)}km radius
                 </p>
-                <p className="mt-1 text-xs text-red-100/80">Confidence: {activeThreatZone.confidence}%</p>
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                  <span className="font-semibold text-slate-700">Confidence: {activeThreatZone.confidence}%</span>
+                  <span className={`rounded border px-2 py-0.5 font-semibold ${activeThreatConfidence?.className}`}>
+                    {activeThreatConfidence?.label}
+                  </span>
+                </div>
               </div>
             </div>
           </div>
@@ -1717,7 +1745,12 @@ function SafeRoutePlanner() {
                     {threatZone ? (
                       <>
                         <div>{threatZone.severity.toUpperCase()} zone: 2km radius</div>
-                        <div className="mt-1">Confidence: {threatZone.confidence}%</div>
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <span>Confidence: {threatZone.confidence}%</span>
+                          <span className={`rounded border px-2 py-0.5 font-semibold ${currentThreatConfidence?.className}`}>
+                            {currentThreatConfidence?.label}
+                          </span>
+                        </div>
                       </>
                     ) : (
                       threatZoneStatus || "Threat zone triggers above 60 risk."
