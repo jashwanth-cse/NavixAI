@@ -8,12 +8,14 @@ import {
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 
 const defaultThreatConfidence = 35;
+const defaultThreatReports = 1;
 
 export type VehicleLocation = {
   lat: number;
@@ -32,13 +34,17 @@ export type ThreatZoneInput = {
   radius: number;
   severity: string;
   confidence?: number;
+  reports?: number;
+  verifiedBy?: string[];
   sourceVehicleId?: string;
   routeKey?: string;
 };
 
-export type ThreatZoneRecord = Omit<ThreatZoneInput, "confidence"> & {
+export type ThreatZoneRecord = Omit<ThreatZoneInput, "confidence" | "reports" | "verifiedBy"> & {
   id: string;
   confidence: number;
+  reports: number;
+  verifiedBy: string[];
   timestamp: Timestamp | null;
 };
 
@@ -175,6 +181,8 @@ export async function createThreatZone({
   radius,
   severity,
   confidence,
+  reports,
+  verifiedBy,
   sourceVehicleId,
   routeKey,
 }: ThreatZoneInput) {
@@ -186,6 +194,8 @@ export async function createThreatZone({
     radius,
     severity,
     confidence: confidence ?? defaultThreatConfidence,
+    reports: reports ?? defaultThreatReports,
+    verifiedBy: verifiedBy ?? (sourceVehicleId ? [sourceVehicleId] : []),
     sourceVehicleId: sourceVehicleId ?? null,
     routeKey: routeKey ?? null,
     timestamp: serverTimestamp(),
@@ -220,6 +230,10 @@ export function subscribeToThreatZones(
             radius: data.radius,
             severity: typeof data.severity === "string" ? data.severity : "high",
             confidence: typeof data.confidence === "number" ? data.confidence : defaultThreatConfidence,
+            reports: typeof data.reports === "number" ? data.reports : defaultThreatReports,
+            verifiedBy: Array.isArray(data.verifiedBy)
+              ? data.verifiedBy.filter((vehicleId): vehicleId is string => typeof vehicleId === "string")
+              : [],
             ...(typeof data.sourceVehicleId === "string"
               ? { sourceVehicleId: data.sourceVehicleId }
               : {}),
@@ -235,6 +249,36 @@ export function subscribeToThreatZones(
       onError?.(error);
     }
   );
+}
+
+export async function verifyThreatZone(threatZoneId: string, vehicleId: string) {
+  const threatZoneRef = doc(db, "threatZones", threatZoneId);
+
+  await runTransaction(db, async (transaction) => {
+    const threatZoneSnapshot = await transaction.get(threatZoneRef);
+
+    if (!threatZoneSnapshot.exists()) {
+      throw new Error("Threat zone no longer exists.");
+    }
+
+    const data = threatZoneSnapshot.data();
+    const currentConfidence =
+      typeof data.confidence === "number" ? data.confidence : defaultThreatConfidence;
+    const currentReports = typeof data.reports === "number" ? data.reports : defaultThreatReports;
+    const verifiedBy = Array.isArray(data.verifiedBy)
+      ? data.verifiedBy.filter((verifiedVehicleId): verifiedVehicleId is string => typeof verifiedVehicleId === "string")
+      : [];
+
+    if (verifiedBy.includes(vehicleId)) {
+      throw new Error("Already verified");
+    }
+
+    transaction.update(threatZoneRef, {
+      confidence: Math.min(currentConfidence + 25, 100),
+      reports: currentReports + 1,
+      verifiedBy: [...verifiedBy, vehicleId],
+    });
+  });
 }
 
 export async function createIncidentMessage({

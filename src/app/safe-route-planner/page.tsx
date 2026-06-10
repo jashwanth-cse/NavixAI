@@ -22,6 +22,7 @@ import {
   subscribeToThreatZones,
   updateVehicleNavigationRoute,
   updateVehicleLiveLocation,
+  verifyThreatZone,
 } from "@/services/firestore";
 
 const googleMapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
@@ -36,6 +37,8 @@ type ThreatZone = {
   radius: number;
   severity: string;
   confidence: number;
+  reports: number;
+  verifiedBy: string[];
   sourceVehicleId?: string;
   routeKey?: string;
 };
@@ -429,6 +432,8 @@ function toThreatZone(record: ThreatZoneRecord): ThreatZone {
     radius: record.radius,
     severity: record.severity,
     confidence: record.confidence ?? defaultThreatConfidence,
+    reports: record.reports,
+    verifiedBy: record.verifiedBy,
     sourceVehicleId: record.sourceVehicleId,
     routeKey: record.routeKey,
   };
@@ -496,6 +501,8 @@ function SafeRoutePlanner() {
   const [incidentMessages, setIncidentMessages] = useState<IncidentMessageRecord[]>([]);
   const [threatZoneStatus, setThreatZoneStatus] = useState("");
   const [threatZoneError, setThreatZoneError] = useState("");
+  const [verifyingThreatId, setVerifyingThreatId] = useState("");
+  const [threatVerificationMessage, setThreatVerificationMessage] = useState("");
   const [incidentError, setIncidentError] = useState("");
   const [rerouteStatus, setRerouteStatus] = useState("");
   const [driverBriefing, setDriverBriefing] = useState("No active advisories.");
@@ -796,9 +803,10 @@ function SafeRoutePlanner() {
             return null;
           }
 
-          return nextZones.some((zone) => zone.id === currentZone.id) ? currentZone : null;
+          return nextZones.find((zone) => zone.id === currentZone.id) ?? null;
         });
         setThreatZoneError("");
+        setThreatVerificationMessage("");
       },
       (error) => {
         setThreatZoneError(error.message);
@@ -888,6 +896,8 @@ function SafeRoutePlanner() {
           radius: 2000,
           severity,
           confidence: defaultThreatConfidence,
+          reports: 1,
+          verifiedBy: navigationId ? [navigationId] : [],
           sourceVehicleId: navigationId || undefined,
           routeKey: routeKey || undefined,
         };
@@ -1286,6 +1296,51 @@ function SafeRoutePlanner() {
     }
   }
 
+  function getVerifiedThreatZone(zone: ThreatZone, vehicleId: string): ThreatZone {
+    return {
+      ...zone,
+      confidence: Math.min(zone.confidence + 25, 100),
+      reports: zone.reports + 1,
+      verifiedBy: zone.verifiedBy.includes(vehicleId) ? zone.verifiedBy : [...zone.verifiedBy, vehicleId],
+    };
+  }
+
+  async function handleVerifyThreat(zone: ThreatZone) {
+    if (!navigationId) {
+      setThreatVerificationMessage("Start navigation to verify");
+      return;
+    }
+
+    if (zone.verifiedBy.includes(navigationId)) {
+      setThreatVerificationMessage("Already verified");
+      return;
+    }
+
+    const verifiedZone = getVerifiedThreatZone(zone, navigationId);
+
+    setVerifyingThreatId(zone.id);
+    setThreatVerificationMessage("");
+    setThreatZones((currentZones) =>
+      currentZones.map((currentZone) => (currentZone.id === zone.id ? verifiedZone : currentZone))
+    );
+    setThreatZone((currentZone) => (currentZone?.id === zone.id ? verifiedZone : currentZone));
+
+    try {
+      await verifyThreatZone(zone.id, navigationId);
+      setThreatZoneError("");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to verify threat.";
+      setThreatVerificationMessage(message === "Already verified" ? "Already verified" : "");
+      setThreatZoneError(message === "Already verified" ? "" : message);
+      setThreatZones((currentZones) =>
+        currentZones.map((currentZone) => (currentZone.id === zone.id ? zone : currentZone))
+      );
+      setThreatZone((currentZone) => (currentZone?.id === zone.id ? zone : currentZone));
+    } finally {
+      setVerifyingThreatId("");
+    }
+  }
+
   async function stopNavigation() {
     const currentNavigationId = navigationId;
 
@@ -1308,6 +1363,7 @@ function SafeRoutePlanner() {
     setNavigationId("");
     setRiskScore(0);
     setThreatZone(null);
+    setThreatVerificationMessage("");
     setDriverBriefing("No active advisories.");
     setAiDecisionLogs(["Navigation stopped. Session document removed from Firestore."]);
     window.sessionStorage.removeItem(navigationSessionStorageKey);
@@ -1344,6 +1400,7 @@ function SafeRoutePlanner() {
     spokenThreatZoneIdsRef.current.clear();
     setRiskScore(0);
     setThreatZone(null);
+    setThreatVerificationMessage("");
     setAiDecisionLogs(["Route intelligence initialized. Monitoring Firestore threat zones and traffic-aware alternatives."]);
     reroutedThreatZonesRef.current.clear();
     rerouteInFlightRef.current = false;
@@ -1492,6 +1549,20 @@ function SafeRoutePlanner() {
                     {activeThreatConfidence?.label}
                   </span>
                 </div>
+                <p className="mt-1 text-xs font-medium text-slate-500">Verified Reports: {activeThreatZone.reports}</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleVerifyThreat(activeThreatZone);
+                  }}
+                  disabled={verifyingThreatId === activeThreatZone.id}
+                  className="pointer-events-auto mt-3 h-9 rounded border border-sky-200 bg-sky-50 px-3 text-xs font-semibold text-sky-700 transition hover:border-sky-300 hover:bg-sky-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+                >
+                  {verifyingThreatId === activeThreatZone.id ? "Verifying..." : "Verify Threat"}
+                </button>
+                {threatVerificationMessage && (
+                  <p className="mt-2 text-xs font-semibold text-slate-600">{threatVerificationMessage}</p>
+                )}
               </div>
             </div>
           </div>
@@ -1751,6 +1822,7 @@ function SafeRoutePlanner() {
                             {currentThreatConfidence?.label}
                           </span>
                         </div>
+                        <div className="mt-1 text-slate-500">Verified Reports: {threatZone.reports}</div>
                       </>
                     ) : (
                       threatZoneStatus || "Threat zone triggers above 60 risk."
