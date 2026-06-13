@@ -74,6 +74,16 @@ type CandidateRoute = {
   distanceMeters: number;
   score: number;
 };
+type SafeStop = {
+  id: string;
+  name: string;
+  type: string;
+  lat: number;
+  lng: number;
+  distanceMeters: number;
+  rating?: number;
+};
+type SafeStopSearchType = "police" | "hospital" | "gas_station" | "parking";
 
 const defaultCenter = { lat: 20.5937, lng: 78.9629 };
 const mapOptions: google.maps.MapOptions = {
@@ -111,7 +121,49 @@ const routeFields = ["path", "durationMillis", "distanceMeters", "localizedValue
 const defaultThreatConfidence = 35;
 const defaultRiskZoneRadiusMeters = 1000;
 const routeRiskScanMeters = 5000;
+const safeStopsSearchRadiusMeters = 5000;
 const earthRadiusMeters = 6371000;
+const safeStopSearchTypes: Array<{ type: SafeStopSearchType; label: string }> = [
+  { type: "police", label: "Police" },
+  { type: "hospital", label: "Hospital" },
+  { type: "gas_station", label: "Fuel" },
+  { type: "parking", label: "Truck Parking" },
+];
+const truckParkingIncludeKeywords = [
+  "truck parking",
+  "truck lay-by",
+  "truck layby",
+  "truck rest area",
+  "truck stop",
+  "freight parking",
+  "freight parking area",
+  "logistics hub parking",
+  "lorry parking",
+  "lorry lay-by",
+  "lorry layby",
+  "hgv parking",
+  "heavy vehicle parking",
+  "goods vehicle parking",
+  "commercial vehicle parking",
+  "transport parking",
+  "freight terminal parking",
+];
+const genericParkingExcludeKeywords = [
+  "car parking",
+  "bike parking",
+  "bicycle parking",
+  "two wheeler parking",
+  "2 wheeler parking",
+  "public parking",
+  "public parking lot",
+  "shopping mall parking",
+  "mall parking",
+  "parking garage",
+  "parking lot",
+  "multi level parking",
+  "multilevel parking",
+  "paid parking",
+];
 const riskReportTypes: Record<RiskReportType, { label: string; eventType: IncidentEventType }> = {
   suspicious: { label: "Suspicious Activity", eventType: "deviation" },
   nails: { label: "Nails on Road", eventType: "stop" },
@@ -429,6 +481,14 @@ function formatRadiusLabel(radiusMeters: number) {
   return `${Math.round(radiusMeters)} m`;
 }
 
+function formatSafeStopDistance(distanceMeters: number) {
+  if (distanceMeters >= 1000) {
+    return `${(distanceMeters / 1000).toFixed(1)} km`;
+  }
+
+  return `${Math.max(1, Math.round(distanceMeters))} m`;
+}
+
 function getRiskZoneStyle(level: RiskZoneLevel) {
   switch (level) {
     case "low":
@@ -480,6 +540,131 @@ function getRiskZoneMarkerIcon(style: ReturnType<typeof getRiskZoneStyle>): goog
     scaledSize: new google.maps.Size(34, 42),
     anchor: new google.maps.Point(17, 41),
   };
+}
+
+function getSafeStopMarkerIcon(type: string): google.maps.Icon {
+  const fill = type === "Hospital" ? "#0f766e" : type === "Police" ? "#2563eb" : type === "Fuel" ? "#16a34a" : "#7c3aed";
+  const label = type === "Hospital" ? "H" : type === "Police" ? "P" : type === "Fuel" ? "F" : "S";
+  const svg = encodeURIComponent(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="32" height="40" viewBox="0 0 32 40">
+      <path d="M16 39s12-11.4 12-23A12 12 0 1 0 4 16c0 11.6 12 23 12 23Z" fill="${fill}" stroke="white" stroke-width="3"/>
+      <circle cx="16" cy="16" r="7" fill="white" opacity="0.96"/>
+      <text x="16" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" font-weight="700" fill="${fill}">${label}</text>
+    </svg>
+  `);
+
+  return {
+    url: `data:image/svg+xml;charset=UTF-8,${svg}`,
+    scaledSize: new google.maps.Size(32, 40),
+    anchor: new google.maps.Point(16, 39),
+  };
+}
+
+function getSafeStopSearchText(place: google.maps.places.PlaceResult) {
+  return [place.name, ...(place.types ?? [])]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .replace(/[_-]+/g, " ")
+    .toLowerCase();
+}
+
+function isTruckRelevantParking(place: google.maps.places.PlaceResult) {
+  const searchText = getSafeStopSearchText(place);
+  const hasTruckSignal = truckParkingIncludeKeywords.some((keyword) => searchText.includes(keyword));
+
+  if (!hasTruckSignal) {
+    return false;
+  }
+
+  return !genericParkingExcludeKeywords.some((keyword) => searchText.includes(keyword));
+}
+
+async function fetchSafeStops({
+  lat,
+  lng,
+}: {
+  lat: number;
+  lng: number;
+}): Promise<SafeStop[]> {
+  const { PlacesService, PlacesServiceStatus } = (await google.maps.importLibrary("places")) as google.maps.PlacesLibrary;
+  const origin = new google.maps.LatLng(lat, lng);
+  const service = new PlacesService(document.createElement("div"));
+
+  const searchByType = ({ type, label }: { type: SafeStopSearchType; label: string }) =>
+    new Promise<SafeStop[]>((resolve, reject) => {
+      service.nearbySearch(
+        {
+          location: origin,
+          radius: safeStopsSearchRadiusMeters,
+          type,
+        },
+        (results, status) => {
+          if (status === PlacesServiceStatus.ZERO_RESULTS) {
+            resolve([]);
+            return;
+          }
+
+          if (status !== PlacesServiceStatus.OK) {
+            reject(new Error(`Places Nearby Search failed for ${label.toLowerCase()}.`));
+            return;
+          }
+
+          resolve(
+            (results ?? [])
+              .filter((place) => type !== "parking" || isTruckRelevantParking(place))
+              .map((place) => {
+                const location = place.geometry?.location;
+
+                if (!location || !place.place_id) {
+                  return null;
+                }
+
+                const position = { lat: location.lat(), lng: location.lng() };
+
+                return {
+                  id: place.place_id,
+                  name: place.name ?? label,
+                  type: label,
+                  lat: position.lat,
+                  lng: position.lng,
+                  distanceMeters: Math.round(getDistanceMeters({ lat, lng }, position)),
+                  ...(typeof place.rating === "number" ? { rating: place.rating } : {}),
+                };
+              })
+              .filter((stop): stop is SafeStop => stop !== null)
+          );
+        }
+      );
+    });
+
+  const settledResults = await Promise.allSettled(safeStopSearchTypes.map(searchByType));
+  const rejectedSearch = settledResults.find((result) => result.status === "rejected");
+
+  if (rejectedSearch?.status === "rejected") {
+    throw rejectedSearch.reason instanceof Error
+      ? rejectedSearch.reason
+      : new Error("Unable to fetch nearby safe stops.");
+  }
+
+  const safeStopsById = new Map<string, SafeStop>();
+
+  settledResults.forEach((result) => {
+    if (result.status !== "fulfilled") {
+      return;
+    }
+
+    result.value.forEach((stop) => {
+      const currentStop = safeStopsById.get(stop.id);
+      if (!currentStop || stop.distanceMeters < currentStop.distanceMeters) {
+        safeStopsById.set(stop.id, stop);
+      }
+    });
+  });
+
+  return Array.from(safeStopsById.values())
+    .filter((stop) => stop.distanceMeters <= safeStopsSearchRadiusMeters)
+    .sort((a, b) => a.distanceMeters - b.distanceMeters)
+    .slice(0, 8);
 }
 
 function getRecommendedRouteLabel(
@@ -737,6 +922,7 @@ function SafeRoutePlanner() {
   const restoringNavigationRef = useRef(false);
   const vehicleIndexRef = useRef(0);
   const latestVehiclePositionRef = useRef<google.maps.LatLngLiteral | null>(null);
+  const lastSafeStopsRequestKeyRef = useRef("");
   const [navigationId, setNavigationId] = useState("");
   const [source, setSource] = useState("");
   const [destination, setDestination] = useState("");
@@ -769,6 +955,10 @@ function SafeRoutePlanner() {
   const [incidentError, setIncidentError] = useState("");
   const [rerouteStatus, setRerouteStatus] = useState("");
   const [driverBriefing, setDriverBriefing] = useState("No active advisories.");
+  const [safeStops, setSafeStops] = useState<SafeStop[]>([]);
+  const [safeStopsLoading, setSafeStopsLoading] = useState(false);
+  const [safeStopsError, setSafeStopsError] = useState("");
+  const [safeStopsOpen, setSafeStopsOpen] = useState(true);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceLanguage, setVoiceLanguage] = useState("en-US");
   const [availableVoiceLanguages, setAvailableVoiceLanguages] = useState<string[]>(["en-US"]);
@@ -848,6 +1038,31 @@ function SafeRoutePlanner() {
         .filter(({ zone, distance, routeConflict }) => routeConflict || distance <= zone.radius + threatApproachBufferMeters)
         .sort((a, b) => a.distance - b.distance)[0]?.zone ?? null
     : null;
+  const safeStopTriggerZone = useMemo(() => {
+    if (!routeCoordinates.length) {
+      return null;
+    }
+
+    const routeZoneMatches = relevantThreatZones
+      .map((zone) => ({
+        zone,
+        level: getRiskZoneLevel(zone.severity),
+        clearanceMeters: getRouteZoneClearanceMeters(routeCoordinates, zone),
+      }))
+      .filter(
+        ({ level, clearanceMeters }) =>
+          (level === "medium" || level === "high") && clearanceMeters <= routeRiskScanMeters
+      )
+      .sort((a, b) => a.clearanceMeters - b.clearanceMeters);
+
+    return routeZoneMatches[0]?.zone ?? null;
+  }, [relevantThreatZones, routeCoordinates]);
+  const safeStopsRerouteActive =
+    rerouteStatus.startsWith("Evaluating") || rerouteStatus.startsWith("Optimized");
+  const safeStopsTriggerId = safeStopTriggerZone?.id ?? (safeStopsRerouteActive ? "reroute" : "");
+  const shouldShowSafeStops =
+    Boolean(safeStopsTriggerId || safeStops.length || safeStopsLoading || safeStopsError) &&
+    Boolean(displayedVehiclePosition || safeStops.length || safeStopsError);
   const currentThreatConfidence = threatZone ? getConfidenceLabel(threatZone.confidence) : null;
   const currentRiskZoneStyle = threatZone
     ? getRiskZoneStyle(getRiskZoneLevel(threatZone.severity))
@@ -1222,6 +1437,55 @@ function SafeRoutePlanner() {
   useEffect(() => {
     latestVehiclePositionRef.current = vehiclePosition;
   }, [vehiclePosition]);
+
+  useEffect(() => {
+    if (!isLoaded || !safeStopsTriggerId || !displayedVehiclePosition) {
+      return;
+    }
+
+    const roundedLat = Math.round(displayedVehiclePosition.lat * 100) / 100;
+    const roundedLng = Math.round(displayedVehiclePosition.lng * 100) / 100;
+    const reroutePhase = safeStopsRerouteActive
+      ? rerouteStatus.split(":")[0]
+      : "route-risk";
+    const requestKey = `${safeStopsTriggerId}:${roundedLat}:${roundedLng}:${reroutePhase}`;
+
+    if (lastSafeStopsRequestKeyRef.current === requestKey) {
+      return;
+    }
+
+    let isCancelled = false;
+    lastSafeStopsRequestKeyRef.current = requestKey;
+    setSafeStopsOpen(true);
+    setSafeStopsLoading(true);
+    setSafeStopsError("");
+
+    fetchSafeStops(displayedVehiclePosition)
+      .then((stops) => {
+        if (isCancelled) {
+          return;
+        }
+
+        setSafeStops(stops);
+      })
+      .catch((error) => {
+        if (isCancelled) {
+          return;
+        }
+
+        setSafeStops([]);
+        setSafeStopsError(error instanceof Error ? error.message : "Unable to fetch safe stops nearby.");
+      })
+      .finally(() => {
+        if (!isCancelled) {
+          setSafeStopsLoading(false);
+        }
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [displayedVehiclePosition, isLoaded, rerouteStatus, safeStopsRerouteActive, safeStopsTriggerId]);
 
   useEffect(() => {
     if (!navigationId) {
@@ -1752,6 +2016,10 @@ function SafeRoutePlanner() {
     setThreatZone(null);
     setThreatVerificationMessage("");
     setDriverBriefing("No active advisories.");
+    setSafeStops([]);
+    setSafeStopsError("");
+    setSafeStopsLoading(false);
+    lastSafeStopsRequestKeyRef.current = "";
     setAiDecisionLogs(["Navigation stopped. Session document removed from Firestore."]);
     window.sessionStorage.removeItem(navigationSessionStorageKey);
     window.sessionStorage.removeItem(navigationStateStorageKey);
@@ -1794,6 +2062,10 @@ function SafeRoutePlanner() {
     setRiskLocationSource("vehicle");
     setThreatZone(null);
     setThreatVerificationMessage("");
+    setSafeStops([]);
+    setSafeStopsError("");
+    setSafeStopsLoading(false);
+    lastSafeStopsRequestKeyRef.current = "";
     setAiDecisionLogs(["Route intelligence initialized. Monitoring Firestore threat zones and traffic-aware alternatives."]);
     reroutedThreatZonesRef.current.clear();
     rerouteInFlightRef.current = false;
@@ -1863,6 +2135,10 @@ function SafeRoutePlanner() {
       setRouteSummary(null);
       setRouteId("");
       setVehiclePosition(null);
+      setSafeStops([]);
+      setSafeStopsError("");
+      setSafeStopsLoading(false);
+      lastSafeStopsRequestKeyRef.current = "";
       latestVehiclePositionRef.current = null;
       vehicleIndexRef.current = 0;
       setVehicleIndex(0);
@@ -1963,6 +2239,16 @@ function SafeRoutePlanner() {
               </Fragment>
             );
           })}
+
+          {safeStops.map((stop) => (
+            <Marker
+              key={stop.id}
+              position={{ lat: stop.lat, lng: stop.lng }}
+              icon={getSafeStopMarkerIcon(stop.type)}
+              title={`${stop.name} - ${stop.type}`}
+              zIndex={38}
+            />
+          ))}
         </GoogleMap>
       )}
 
@@ -2267,6 +2553,83 @@ function SafeRoutePlanner() {
                 </div>
               )}
             </div>
+
+            {shouldShowSafeStops && (
+              <div className="rounded-2xl border border-emerald-200 bg-white/85 p-3">
+                <button
+                  type="button"
+                  onClick={() => setSafeStopsOpen((isOpen) => !isOpen)}
+                  className="flex w-full items-center justify-between gap-3 text-left"
+                >
+                  <span>
+                    <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-emerald-700/80">
+                      Safe Stops
+                    </span>
+                    <span className="mt-1 block text-sm font-semibold text-slate-900">
+                      Nearby driver options
+                    </span>
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700">
+                      {safeStopsLoading ? "..." : safeStops.length}
+                    </span>
+                    <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-emerald-700">
+                      {safeStopsOpen ? "Hide" : "Open"}
+                    </span>
+                  </div>
+                </button>
+
+                {safeStopsOpen && (
+                  <div className="mt-3">
+                    {safeStopsLoading && (
+                      <div className="flex items-center gap-2 rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700">
+                        <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                          <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                        </svg>
+                        Finding safe stops within 5 km
+                      </div>
+                    )}
+
+                    {!safeStopsLoading && safeStopsError && (
+                      <p className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+                        {safeStopsError}
+                      </p>
+                    )}
+
+                    {!safeStopsLoading && !safeStopsError && safeStops.length === 0 && (
+                      <p className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-600">
+                        No safe stops found nearby.
+                      </p>
+                    )}
+
+                    {!safeStopsLoading && !safeStopsError && safeStops.length > 0 && (
+                      <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
+                        {safeStops.map((stop) => (
+                          <div
+                            key={stop.id}
+                            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="truncate font-semibold text-slate-900">{stop.name}</p>
+                                <p className="mt-1 font-medium text-emerald-700">{stop.type}</p>
+                              </div>
+                              <span className="shrink-0 rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 font-semibold text-emerald-700">
+                                {formatSafeStopDistance(stop.distanceMeters)}
+                              </span>
+                            </div>
+                            {typeof stop.rating === "number" && (
+                              <p className="mt-1 text-slate-500">Rating: {stop.rating.toFixed(1)}</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="rounded-2xl border border-slate-200 bg-white/80 p-3">
               <button
