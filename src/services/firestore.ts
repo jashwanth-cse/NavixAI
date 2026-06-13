@@ -18,6 +18,44 @@ const defaultThreatConfidence = 35;
 const defaultThreatReports = 1;
 const defaultThreatRadiusMeters = 1000;
 
+function getThreatLevelFromReports(reports: number) {
+  if (reports <= 2) {
+    return "low";
+  }
+
+  if (reports < 5) {
+    return "medium";
+  }
+
+  return "high";
+}
+
+function getThreatConfidenceFromReports(reports: number) {
+  const level = getThreatLevelFromReports(reports);
+
+  if (level === "low") {
+    return 25;
+  }
+
+  if (level === "medium") {
+    return 60;
+  }
+
+  return 85;
+}
+
+function getThreatRadiusFromLevel(level: string) {
+  if (level === "low") {
+    return 300;
+  }
+
+  if (level === "medium") {
+    return 700;
+  }
+
+  return defaultThreatRadiusMeters;
+}
+
 export type VehicleLocation = {
   lat: number;
   lng: number;
@@ -189,14 +227,15 @@ export async function createThreatZone({
   routeKey,
 }: ThreatZoneInput) {
   const threatZonesCollection = collection(db, "threatZones");
+  const reportCount = reports ?? defaultThreatReports;
 
   const docRef = await addDoc(threatZonesCollection, {
     lat,
     lng,
     radius: radius ?? defaultThreatRadiusMeters,
     severity,
-    confidence: confidence ?? defaultThreatConfidence,
-    reports: reports ?? defaultThreatReports,
+    confidence: confidence ?? getThreatConfidenceFromReports(reportCount),
+    reports: reportCount,
     verifiedBy: verifiedBy ?? (sourceVehicleId ? [sourceVehicleId] : []),
     sourceVehicleId: sourceVehicleId ?? null,
     routeKey: routeKey ?? null,
@@ -263,9 +302,10 @@ export async function verifyThreatZone(threatZoneId: string, vehicleId: string) 
     }
 
     const data = threatZoneSnapshot.data();
-    const currentConfidence =
-      typeof data.confidence === "number" ? data.confidence : defaultThreatConfidence;
     const currentReports = typeof data.reports === "number" ? data.reports : defaultThreatReports;
+    const nextReports = currentReports + 1;
+    const nextSeverity = getThreatLevelFromReports(nextReports);
+    const nextConfidence = getThreatConfidenceFromReports(nextReports);
     const verifiedBy = Array.isArray(data.verifiedBy)
       ? data.verifiedBy.filter((verifiedVehicleId): verifiedVehicleId is string => typeof verifiedVehicleId === "string")
       : [];
@@ -275,8 +315,10 @@ export async function verifyThreatZone(threatZoneId: string, vehicleId: string) 
     }
 
     transaction.update(threatZoneRef, {
-      confidence: Math.min(currentConfidence + 25, 100),
-      reports: currentReports + 1,
+      confidence: nextConfidence,
+      reports: nextReports,
+      severity: nextSeverity,
+      radius: getThreatRadiusFromLevel(nextSeverity),
       verifiedBy: [...verifiedBy, vehicleId],
     });
   });

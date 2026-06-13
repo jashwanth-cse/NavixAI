@@ -119,6 +119,8 @@ const candidateBearings = [0, 45, 90, 135, 180, 225, 270, 315];
 const maxDecisionLogs = 14;
 const routeFields = ["path", "durationMillis", "distanceMeters", "localizedValues"];
 const defaultThreatConfidence = 35;
+const initialThreatReports = 1;
+const initialThreatConfidence = 25;
 const defaultRiskZoneRadiusMeters = 1000;
 const routeRiskScanMeters = 5000;
 const safeStopsSearchRadiusMeters = 5000;
@@ -404,25 +406,29 @@ function calculateRouteRiskScore(path: google.maps.LatLngLiteral[], zones: Threa
     return 0;
   }
 
-  const exposureScore = zones.reduce((total, zone) => {
+  const exposedConfidence = zones.reduce((highestConfidence, zone) => {
     const clearanceMeters = getRouteZoneClearanceMeters(path, zone);
     const exposureWeight = getThreatExposureWeight(clearanceMeters);
 
-    return total + zone.confidence * exposureWeight;
+    if (exposureWeight <= 0) {
+      return highestConfidence;
+    }
+
+    return Math.max(highestConfidence, zone.confidence);
   }, 0);
 
-  return Math.min(100, Math.max(0, Math.round(exposureScore)));
+  return Math.min(100, Math.max(0, Math.round(exposedConfidence)));
 }
 
 function getRouteRiskCategory(risk: number) {
-  if (risk <= 30) {
+  if (risk <= 25) {
     return {
       label: "Low Risk",
       className: "border-slate-300 bg-slate-50 text-slate-700",
     };
   }
 
-  if (risk <= 70) {
+  if (risk <= 75) {
     return {
       label: "Medium Risk",
       className: "border-amber-200 bg-amber-50 text-amber-700",
@@ -435,30 +441,42 @@ function getRouteRiskCategory(risk: number) {
   };
 }
 
-function getRiskZoneLevel(severity: string): RiskZoneLevel {
-  const normalizedSeverity = severity.trim().toLowerCase();
-
-  if (normalizedSeverity === "low") {
+function getRiskZoneLevelFromConfidence(confidence: number): RiskZoneLevel {
+  if (confidence <= 25) {
     return "low";
   }
 
-  if (normalizedSeverity === "medium" || normalizedSeverity === "moderate") {
+  if (confidence <= 75) {
     return "medium";
   }
 
   return "high";
 }
 
-function getRiskZoneLevelFromScore(score: number): RiskZoneLevel {
-  if (score <= 30) {
+function getRiskZoneLevelFromReports(reports: number): RiskZoneLevel {
+  if (reports <= 2) {
     return "low";
   }
 
-  if (score <= 70) {
+  if (reports < 5) {
     return "medium";
   }
 
   return "high";
+}
+
+function getThreatConfidenceFromReports(reports: number) {
+  const level = getRiskZoneLevelFromReports(reports);
+
+  if (level === "low") {
+    return 25;
+  }
+
+  if (level === "medium") {
+    return 60;
+  }
+
+  return 85;
 }
 
 function getRiskZoneRadiusMeters(level: RiskZoneLevel) {
@@ -707,14 +725,14 @@ function formatThreatDecisionLabel(zone: ThreatZone) {
 }
 
 function getConfidenceLabel(confidence: number) {
-  if (confidence <= 40) {
+  if (confidence <= 25) {
     return {
       label: "Low Confidence",
       className: "border-emerald-200 bg-emerald-50 text-emerald-700",
     };
   }
 
-  if (confidence <= 70) {
+  if (confidence <= 75) {
     return {
       label: "Medium Confidence",
       className: "border-amber-200 bg-amber-50 text-amber-700",
@@ -1023,7 +1041,7 @@ function SafeRoutePlanner() {
     : null;
   const activeThreatConfidence = activeThreatZone ? getConfidenceLabel(activeThreatZone.confidence) : null;
   const activeRiskZoneStyle = activeThreatZone
-    ? getRiskZoneStyle(getRiskZoneLevel(activeThreatZone.severity))
+    ? getRiskZoneStyle(getRiskZoneLevelFromConfidence(activeThreatZone.confidence))
     : null;
   const upcomingThreatZone = displayedVehiclePosition
     ? relevantThreatZones
@@ -1046,7 +1064,7 @@ function SafeRoutePlanner() {
     const routeZoneMatches = relevantThreatZones
       .map((zone) => ({
         zone,
-        level: getRiskZoneLevel(zone.severity),
+        level: getRiskZoneLevelFromConfidence(zone.confidence),
         clearanceMeters: getRouteZoneClearanceMeters(routeCoordinates, zone),
       }))
       .filter(
@@ -1065,17 +1083,8 @@ function SafeRoutePlanner() {
     Boolean(displayedVehiclePosition || safeStops.length || safeStopsError);
   const currentThreatConfidence = threatZone ? getConfidenceLabel(threatZone.confidence) : null;
   const currentRiskZoneStyle = threatZone
-    ? getRiskZoneStyle(getRiskZoneLevel(threatZone.severity))
+    ? getRiskZoneStyle(getRiskZoneLevelFromConfidence(threatZone.confidence))
     : null;
-  const riskColor =
-    riskScore >= 70
-      ? "bg-rose-100 text-rose-700"
-    : riskScore >= 40
-      ? "bg-amber-100 text-amber-700"
-        : "bg-slate-100 text-slate-700";
-  const riskTrackColor =
-    riskScore >= 70 ? "bg-red-400" : riskScore >= 40 ? "bg-yellow-300" : "bg-slate-400";
-
   const vehicleSpeed = useMemo(() => {
     const distanceMeters = routeSummary?.distanceMeters;
     const durationSeconds = routeSummary?.durationSeconds;
@@ -1395,17 +1404,21 @@ function SafeRoutePlanner() {
     }
 
     const zoneCenter = selectedRiskLocation ?? displayedVehiclePosition ?? routeCoordinates[0] ?? defaultCenter;
-    const riskZoneLevel = getRiskZoneLevelFromScore(riskScore);
+    const reportCount = initialThreatReports;
+    const confidence = initialThreatConfidence;
+    const riskZoneLevel = getRiskZoneLevelFromReports(reportCount);
     const severity = riskZoneLevel;
     const zoneRadius = getRiskZoneRadiusMeters(riskZoneLevel);
     threatZoneCreatedRef.current = true;
-    setThreatZoneStatus("Creating threat zone");
+    setThreatZoneStatus("Creating risk zone");
 
     createThreatZone({
       lat: zoneCenter.lat,
       lng: zoneCenter.lng,
       radius: zoneRadius,
       severity,
+      confidence,
+      reports: reportCount,
       sourceVehicleId: navigationId || undefined,
       routeKey: routeKey || undefined,
     })
@@ -1415,8 +1428,8 @@ function SafeRoutePlanner() {
           center: zoneCenter,
           radius: zoneRadius,
           severity,
-          confidence: defaultThreatConfidence,
-          reports: 1,
+          confidence,
+          reports: reportCount,
           verifiedBy: navigationId ? [navigationId] : [],
           sourceVehicleId: navigationId || undefined,
           routeKey: routeKey || undefined,
@@ -1426,11 +1439,11 @@ function SafeRoutePlanner() {
         setThreatZones((currentZones) =>
           currentZones.some((zone) => zone.id === id) ? currentZones : [...currentZones, nextThreatZone]
         );
-        setThreatZoneStatus("Threat zone active");
+        setThreatZoneStatus("Risk zone active");
       })
       .catch((error) => {
         threatZoneCreatedRef.current = false;
-        setThreatZoneStatus(error instanceof Error ? error.message : "Unable to create threat zone");
+        setThreatZoneStatus(error instanceof Error ? error.message : "Unable to create risk zone");
       });
   }, [displayedVehiclePosition, navigationId, riskScore, routeCoordinates, routeKey, selectedRiskLocation]);
 
@@ -1915,7 +1928,7 @@ function SafeRoutePlanner() {
     }
 
     setRiskScore((currentScore) => Math.min(100, currentScore + riskReportIncrement));
-    setRiskReportMessage(`${riskType.label} report submitted.`);
+    setRiskReportMessage("Thanks for helping other drivers.");
     setRiskReportOpen(false);
     addAiDecisionLog(
       `${riskType.label} risk report submitted${riskIssueDetails.trim() ? `: ${riskIssueDetails.trim()}` : "."}`
@@ -1941,10 +1954,15 @@ function SafeRoutePlanner() {
   }
 
   function getVerifiedThreatZone(zone: ThreatZone, vehicleId: string): ThreatZone {
+    const reports = zone.reports + 1;
+    const severity = getRiskZoneLevelFromReports(reports);
+
     return {
       ...zone,
-      confidence: Math.min(zone.confidence + 25, 100),
-      reports: zone.reports + 1,
+      confidence: getThreatConfidenceFromReports(reports),
+      reports,
+      radius: getRiskZoneRadiusMeters(severity),
+      severity,
       verifiedBy: zone.verifiedBy.includes(vehicleId) ? zone.verifiedBy : [...zone.verifiedBy, vehicleId],
     };
   }
@@ -2215,7 +2233,7 @@ function SafeRoutePlanner() {
           )}
 
           {threatZones.map((zone) => {
-            const zoneStyle = getRiskZoneStyle(getRiskZoneLevel(zone.severity));
+            const zoneStyle = getRiskZoneStyle(getRiskZoneLevelFromConfidence(zone.confidence));
 
             return (
               <Fragment key={zone.id}>
@@ -2276,7 +2294,7 @@ function SafeRoutePlanner() {
                   {activeRiskZoneStyle?.label ?? "High Risk"} Zone Ahead
                 </p>
                 <p className="mt-1 text-xs text-slate-600">
-                  {activeThreatZone.severity.toUpperCase()} threat within {formatRadiusLabel(activeThreatZone.radius)} radius
+                  {activeRiskZoneStyle?.label ?? "High Risk"} within {formatRadiusLabel(activeThreatZone.radius)} radius
                 </p>
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                   <span className="font-semibold text-slate-700">Confidence: {activeThreatZone.confidence}%</span>
@@ -2642,7 +2660,6 @@ function SafeRoutePlanner() {
                   <span className="mt-1 block text-sm font-semibold text-slate-900">Event Report</span>
                 </span>
                 <div className="flex items-center gap-2">
-                  <span className={`rounded px-2 py-1 text-xs font-semibold ${riskColor}`}>{riskScore}/100</span>
                   <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-sky-700">
                     {riskOpen ? "Hide" : "Open"}
                   </span>
@@ -2651,14 +2668,7 @@ function SafeRoutePlanner() {
 
               {riskOpen && (
                 <div className="mt-3">
-                  <div className="h-2 overflow-hidden rounded-full bg-slate-200">
-                    <div
-                      className={`h-full rounded-full transition-all duration-300 ${riskTrackColor}`}
-                      style={{ width: `${riskScore}%` }}
-                    />
-                  </div>
-
-                  <div className="mt-3">
+                  <div>
                     <button
                       type="button"
                       onClick={() => {
