@@ -229,7 +229,7 @@ export function subscribeToThreatZones(
             lat: data.lat,
             lng: data.lng,
             radius: typeof data.radius === "number" ? data.radius : defaultThreatRadiusMeters,
-            severity: typeof data.severity === "string" ? data.severity : "high",
+            severity: typeof data.severity === "string" ? data.severity : "unknown",
             confidence: typeof data.confidence === "number" ? data.confidence : defaultThreatConfidence,
             reports: typeof data.reports === "number" ? data.reports : defaultThreatReports,
             verifiedBy: Array.isArray(data.verifiedBy)
