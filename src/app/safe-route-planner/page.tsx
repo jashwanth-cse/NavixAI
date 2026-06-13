@@ -125,6 +125,11 @@ const defaultRiskZoneRadiusMeters = 1000;
 const routeRiskScanMeters = 5000;
 const safeStopsSearchRadiusMeters = 5000;
 const earthRadiusMeters = 6371000;
+const riskZoneColors = {
+  low: "#808080",
+  medium: "#FFA500",
+  high: "#FF0000",
+} satisfies Record<RiskZoneLevel, string>;
 const safeStopSearchTypes: Array<{ type: SafeStopSearchType; label: string }> = [
   { type: "police", label: "Police" },
   { type: "hospital", label: "Hospital" },
@@ -424,20 +429,20 @@ function getRouteRiskCategory(risk: number) {
   if (risk <= 25) {
     return {
       label: "Low Risk",
-      className: "border-slate-300 bg-slate-50 text-slate-700",
+      className: "border-[#808080]/40 bg-[#808080]/10 text-[#808080]",
     };
   }
 
   if (risk <= 75) {
     return {
       label: "Medium Risk",
-      className: "border-amber-200 bg-amber-50 text-amber-700",
+      className: "border-[#FFA500]/45 bg-[#FFA500]/10 text-[#B36B00]",
     };
   }
 
   return {
     label: "High Risk",
-    className: "border-rose-200 bg-rose-50 text-rose-700",
+    className: "border-[#FF0000]/35 bg-[#FF0000]/10 text-[#FF0000]",
   };
 }
 
@@ -512,33 +517,36 @@ function getRiskZoneStyle(level: RiskZoneLevel) {
     case "low":
       return {
         label: "Low Risk",
-        mapFill: "#9ca3af",
-        mapStroke: "#6b7280",
+        color: riskZoneColors.low,
+        mapFill: riskZoneColors.low,
+        mapStroke: riskZoneColors.low,
         cardClassName: "border-slate-300 bg-slate-50",
-        iconClassName: "border-slate-300 bg-slate-100 text-slate-700",
-        badgeClassName: "border-slate-300 bg-white text-slate-700",
-        markerFill: "#6b7280",
+        iconClassName: "border-[#808080]/40 bg-[#808080]/10 text-[#808080]",
+        badgeClassName: "border-[#808080]/40 bg-[#808080]/10 text-[#808080]",
+        markerFill: riskZoneColors.low,
       };
     case "medium":
       return {
         label: "Medium Risk",
-        mapFill: "#facc15",
-        mapStroke: "#ca8a04",
-        cardClassName: "border-yellow-300 bg-yellow-50",
-        iconClassName: "border-yellow-300 bg-yellow-100 text-yellow-700",
-        badgeClassName: "border-yellow-300 bg-white text-yellow-700",
-        markerFill: "#ca8a04",
+        color: riskZoneColors.medium,
+        mapFill: riskZoneColors.medium,
+        mapStroke: riskZoneColors.medium,
+        cardClassName: "border-[#FFA500]/45 bg-[#FFA500]/10",
+        iconClassName: "border-[#FFA500]/45 bg-[#FFA500]/10 text-[#B36B00]",
+        badgeClassName: "border-[#FFA500]/45 bg-[#FFA500]/10 text-[#B36B00]",
+        markerFill: riskZoneColors.medium,
       };
     case "high":
     default:
       return {
         label: "High Risk",
-        mapFill: "#ef4444",
-        mapStroke: "#dc2626",
-        cardClassName: "border-red-300 bg-red-50",
-        iconClassName: "border-red-200 bg-red-50 text-red-600",
-        badgeClassName: "border-red-200 bg-white text-red-700",
-        markerFill: "#dc2626",
+        color: riskZoneColors.high,
+        mapFill: riskZoneColors.high,
+        mapStroke: riskZoneColors.high,
+        cardClassName: "border-[#FF0000]/35 bg-[#FF0000]/10",
+        iconClassName: "border-[#FF0000]/35 bg-[#FF0000]/10 text-[#FF0000]",
+        badgeClassName: "border-[#FF0000]/35 bg-[#FF0000]/10 text-[#FF0000]",
+        markerFill: riskZoneColors.high,
       };
   }
 }
