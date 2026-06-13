@@ -16,6 +16,7 @@ import { db } from "@/lib/firebase";
 
 const defaultThreatConfidence = 35;
 const defaultThreatReports = 1;
+const defaultThreatRadiusMeters = 1000;
 
 export type VehicleLocation = {
   lat: number;
@@ -31,7 +32,7 @@ export type TrackedVehicle = {
 export type ThreatZoneInput = {
   lat: number;
   lng: number;
-  radius: number;
+  radius?: number;
   severity: string;
   confidence?: number;
   reports?: number;
@@ -40,8 +41,9 @@ export type ThreatZoneInput = {
   routeKey?: string;
 };
 
-export type ThreatZoneRecord = Omit<ThreatZoneInput, "confidence" | "reports" | "verifiedBy"> & {
+export type ThreatZoneRecord = Omit<ThreatZoneInput, "radius" | "confidence" | "reports" | "verifiedBy"> & {
   id: string;
+  radius: number;
   confidence: number;
   reports: number;
   verifiedBy: string[];
@@ -191,7 +193,7 @@ export async function createThreatZone({
   const docRef = await addDoc(threatZonesCollection, {
     lat,
     lng,
-    radius,
+    radius: radius ?? defaultThreatRadiusMeters,
     severity,
     confidence: confidence ?? defaultThreatConfidence,
     reports: reports ?? defaultThreatReports,
@@ -217,8 +219,7 @@ export function subscribeToThreatZones(
 
           if (
             typeof data.lat !== "number" ||
-            typeof data.lng !== "number" ||
-            typeof data.radius !== "number"
+            typeof data.lng !== "number"
           ) {
             return null;
           }
@@ -227,7 +228,7 @@ export function subscribeToThreatZones(
             id: threatZoneDoc.id,
             lat: data.lat,
             lng: data.lng,
-            radius: data.radius,
+            radius: typeof data.radius === "number" ? data.radius : defaultThreatRadiusMeters,
             severity: typeof data.severity === "string" ? data.severity : "high",
             confidence: typeof data.confidence === "number" ? data.confidence : defaultThreatConfidence,
             reports: typeof data.reports === "number" ? data.reports : defaultThreatReports,

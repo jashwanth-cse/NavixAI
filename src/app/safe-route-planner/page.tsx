@@ -9,7 +9,7 @@ import {
   Polyline,
   useJsApiLoader,
 } from "@react-google-maps/api";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IncidentEventType,
   IncidentMessageRecord,
@@ -30,7 +30,9 @@ const libraries: "places"[] = ["places"];
 
 type RouteStatus = "idle" | "loading" | "success" | "error";
 type VehicleStatus = "Awaiting route" | "In transit" | "Arrived";
-type RiskEvent = "door" | "stop" | "deviation";
+type RiskReportType = "suspicious" | "nails" | "unsafe";
+type RiskLocationSource = "vehicle" | "map" | "place";
+type RiskZoneLevel = "low" | "medium" | "high";
 type ThreatZone = {
   id: string;
   center: google.maps.LatLngLiteral;
@@ -46,6 +48,13 @@ type RouteSummary = {
   distanceMeters: number;
   durationSeconds: number;
   distanceText: string;
+  durationText: string;
+};
+type GeneratedRouteOption = {
+  label: string;
+  path: google.maps.LatLngLiteral[];
+  distanceText: string;
+  durationSeconds: number;
   durationText: string;
 };
 type NavigationSnapshot = {
@@ -100,11 +109,15 @@ const candidateBearings = [0, 45, 90, 135, 180, 225, 270, 315];
 const maxDecisionLogs = 14;
 const routeFields = ["path", "durationMillis", "distanceMeters", "localizedValues"];
 const defaultThreatConfidence = 35;
-const riskEvents: Record<RiskEvent, { label: string; increment: number }> = {
-  door: { label: "Trigger Door Open", increment: 18 },
-  stop: { label: "Trigger Stop", increment: 24 },
-  deviation: { label: "Trigger Deviation", increment: 35 },
+const defaultRiskZoneRadiusMeters = 1000;
+const routeRiskScanMeters = 5000;
+const earthRadiusMeters = 6371000;
+const riskReportTypes: Record<RiskReportType, { label: string; eventType: IncidentEventType }> = {
+  suspicious: { label: "Suspicious Activity", eventType: "deviation" },
+  nails: { label: "Nails on Road", eventType: "stop" },
+  unsafe: { label: "Unsafe Area", eventType: "door" },
 };
+const riskReportIncrement = 70;
 
 function createRouteId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -127,7 +140,6 @@ function getFutureDepartureTime() {
 }
 
 function getDistanceMeters(start: google.maps.LatLngLiteral, end: google.maps.LatLngLiteral) {
-  const earthRadiusMeters = 6371000;
   const startLat = (start.lat * Math.PI) / 180;
   const endLat = (end.lat * Math.PI) / 180;
   const deltaLat = ((end.lat - start.lat) * Math.PI) / 180;
@@ -138,6 +150,53 @@ function getDistanceMeters(start: google.maps.LatLngLiteral, end: google.maps.La
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
   return earthRadiusMeters * c;
+}
+
+function getBearingRadians(start: google.maps.LatLngLiteral, end: google.maps.LatLngLiteral) {
+  const startLat = (start.lat * Math.PI) / 180;
+  const endLat = (end.lat * Math.PI) / 180;
+  const deltaLng = ((end.lng - start.lng) * Math.PI) / 180;
+  const y = Math.sin(deltaLng) * Math.cos(endLat);
+  const x =
+    Math.cos(startLat) * Math.sin(endLat) -
+    Math.sin(startLat) * Math.cos(endLat) * Math.cos(deltaLng);
+
+  return Math.atan2(y, x);
+}
+
+function getPointToGeodesicSegmentDistanceMeters(
+  point: google.maps.LatLngLiteral,
+  segmentStart: google.maps.LatLngLiteral,
+  segmentEnd: google.maps.LatLngLiteral
+) {
+  const segmentLengthMeters = getDistanceMeters(segmentStart, segmentEnd);
+
+  if (segmentLengthMeters === 0) {
+    return getDistanceMeters(point, segmentStart);
+  }
+
+  const angularDistanceStartToPoint = getDistanceMeters(segmentStart, point) / earthRadiusMeters;
+  const bearingStartToPoint = getBearingRadians(segmentStart, point);
+  const bearingStartToEnd = getBearingRadians(segmentStart, segmentEnd);
+  const crossTrackAngularDistance = Math.asin(
+    Math.sin(angularDistanceStartToPoint) * Math.sin(bearingStartToPoint - bearingStartToEnd)
+  );
+  const alongTrackAngularDistance = Math.acos(
+    Math.min(
+      1,
+      Math.max(
+        -1,
+        Math.cos(angularDistanceStartToPoint) / Math.cos(crossTrackAngularDistance)
+      )
+    )
+  );
+  const alongTrackMeters = alongTrackAngularDistance * earthRadiusMeters;
+
+  if (!Number.isFinite(alongTrackMeters) || alongTrackMeters < 0 || alongTrackMeters > segmentLengthMeters) {
+    return Math.min(getDistanceMeters(point, segmentStart), getDistanceMeters(point, segmentEnd));
+  }
+
+  return Math.abs(crossTrackAngularDistance) * earthRadiusMeters;
 }
 
 function toLatLngLiteral(point: google.maps.LatLngLiteral | google.maps.LatLng | { lat: number; lng: number }) {
@@ -246,6 +305,200 @@ function getMinimumZoneClearanceMeters(path: google.maps.LatLngLiteral[], zones:
       path.map((point) => getDistanceMeters(point, zone.center) - zone.radius)
     )
   );
+}
+
+function getRouteZoneClearanceMeters(path: google.maps.LatLngLiteral[], zone: ThreatZone) {
+  if (!path.length) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  if (path.length === 1) {
+    return getDistanceMeters(path[0], zone.center) - zone.radius;
+  }
+
+  let clearanceMeters = Number.POSITIVE_INFINITY;
+
+  for (let index = 1; index < path.length; index += 1) {
+    const segmentClearance =
+      getPointToGeodesicSegmentDistanceMeters(zone.center, path[index - 1], path[index]) - zone.radius;
+    clearanceMeters = Math.min(clearanceMeters, segmentClearance);
+  }
+
+  return clearanceMeters;
+}
+
+function getThreatExposureWeight(clearanceMeters: number) {
+  if (clearanceMeters <= 0) {
+    return 1.15;
+  }
+
+  if (clearanceMeters <= 500) {
+    return 1;
+  }
+
+  if (clearanceMeters <= 1000) {
+    return 0.65;
+  }
+
+  if (clearanceMeters <= routeRiskScanMeters) {
+    return 0.65 * (1 - (clearanceMeters - 1000) / (routeRiskScanMeters - 1000));
+  }
+
+  return 0;
+}
+
+function calculateRouteRiskScore(path: google.maps.LatLngLiteral[], zones: ThreatZone[]) {
+  if (!path.length || !zones.length) {
+    return 0;
+  }
+
+  const exposureScore = zones.reduce((total, zone) => {
+    const clearanceMeters = getRouteZoneClearanceMeters(path, zone);
+    const exposureWeight = getThreatExposureWeight(clearanceMeters);
+
+    return total + zone.confidence * exposureWeight;
+  }, 0);
+
+  return Math.min(100, Math.max(0, Math.round(exposureScore)));
+}
+
+function getRouteRiskCategory(risk: number) {
+  if (risk <= 30) {
+    return {
+      label: "Low Risk",
+      className: "border-slate-300 bg-slate-50 text-slate-700",
+    };
+  }
+
+  if (risk <= 70) {
+    return {
+      label: "Medium Risk",
+      className: "border-amber-200 bg-amber-50 text-amber-700",
+    };
+  }
+
+  return {
+    label: "High Risk",
+    className: "border-rose-200 bg-rose-50 text-rose-700",
+  };
+}
+
+function getRiskZoneLevel(severity: string): RiskZoneLevel {
+  const normalizedSeverity = severity.trim().toLowerCase();
+
+  if (normalizedSeverity === "low") {
+    return "low";
+  }
+
+  if (normalizedSeverity === "medium" || normalizedSeverity === "moderate") {
+    return "medium";
+  }
+
+  return "high";
+}
+
+function getRiskZoneLevelFromScore(score: number): RiskZoneLevel {
+  if (score <= 30) {
+    return "low";
+  }
+
+  if (score <= 70) {
+    return "medium";
+  }
+
+  return "high";
+}
+
+function getRiskZoneRadiusMeters(level: RiskZoneLevel) {
+  switch (level) {
+    case "low":
+      return 300;
+    case "medium":
+      return 700;
+    case "high":
+    default:
+      return defaultRiskZoneRadiusMeters;
+  }
+}
+
+function formatRadiusLabel(radiusMeters: number) {
+  if (radiusMeters >= 1000) {
+    return `${Number.isInteger(radiusMeters / 1000) ? radiusMeters / 1000 : (radiusMeters / 1000).toFixed(1)} km`;
+  }
+
+  return `${Math.round(radiusMeters)} m`;
+}
+
+function getRiskZoneStyle(level: RiskZoneLevel) {
+  switch (level) {
+    case "low":
+      return {
+        label: "Low Risk",
+        mapFill: "#9ca3af",
+        mapStroke: "#6b7280",
+        cardClassName: "border-slate-300 bg-slate-50",
+        iconClassName: "border-slate-300 bg-slate-100 text-slate-700",
+        badgeClassName: "border-slate-300 bg-white text-slate-700",
+        markerFill: "#6b7280",
+      };
+    case "medium":
+      return {
+        label: "Medium Risk",
+        mapFill: "#facc15",
+        mapStroke: "#ca8a04",
+        cardClassName: "border-yellow-300 bg-yellow-50",
+        iconClassName: "border-yellow-300 bg-yellow-100 text-yellow-700",
+        badgeClassName: "border-yellow-300 bg-white text-yellow-700",
+        markerFill: "#ca8a04",
+      };
+    case "high":
+    default:
+      return {
+        label: "High Risk",
+        mapFill: "#ef4444",
+        mapStroke: "#dc2626",
+        cardClassName: "border-red-300 bg-red-50",
+        iconClassName: "border-red-200 bg-red-50 text-red-600",
+        badgeClassName: "border-red-200 bg-white text-red-700",
+        markerFill: "#dc2626",
+      };
+  }
+}
+
+function getRiskZoneMarkerIcon(style: ReturnType<typeof getRiskZoneStyle>): google.maps.Icon {
+  const svg = encodeURIComponent(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="34" height="42" viewBox="0 0 34 42">
+      <path d="M17 41s14-13.2 14-24A14 14 0 1 0 3 17c0 10.8 14 24 14 24Z" fill="${style.markerFill}" stroke="white" stroke-width="3"/>
+      <path d="M17 9.5 24.4 23H9.6L17 9.5Z" fill="white" opacity="0.95"/>
+      <path d="M17 14.2v4.9" stroke="${style.markerFill}" stroke-width="2.2" stroke-linecap="round"/>
+      <circle cx="17" cy="22.5" r="1.3" fill="${style.markerFill}"/>
+    </svg>
+  `);
+
+  return {
+    url: `data:image/svg+xml;charset=UTF-8,${svg}`,
+    scaledSize: new google.maps.Size(34, 42),
+    anchor: new google.maps.Point(17, 41),
+  };
+}
+
+function getRecommendedRouteLabel(
+  routes: Array<{ label: string; durationSeconds: number; risk: number }>
+) {
+  if (!routes.length) {
+    return null;
+  }
+
+  const fastestDurationSeconds = Math.min(...routes.map((route) => route.durationSeconds));
+  const viableRoutes = routes.filter((route) => route.risk < 85);
+  const candidateRoutes = viableRoutes.length ? viableRoutes : routes;
+  const reasonableEtaLimitSeconds = Math.max(fastestDurationSeconds + 10 * 60, fastestDurationSeconds * 1.15);
+  const reasonableEtaRoutes = candidateRoutes.filter(
+    (route) => route.durationSeconds <= reasonableEtaLimitSeconds
+  );
+  const recommendationPool = reasonableEtaRoutes.length ? reasonableEtaRoutes : candidateRoutes;
+
+  return [...recommendationPool].sort((a, b) => a.risk - b.risk || a.durationSeconds - b.durationSeconds)[0].label;
 }
 
 function getRouteKey(source: string, destination: string) {
@@ -410,6 +663,7 @@ async function computeRoutes({
     polylineQuality: "HIGH_QUALITY",
     fields: routeFields,
   });
+  console.info(`Google Routes API returned ${response.routes?.length ?? 0} route(s).`);
 
   return (response.routes ?? []).map((route) => {
     const path = ((route.path as Array<google.maps.LatLngLiteral | google.maps.LatLng>) ?? []).map(toLatLngLiteral);
@@ -429,7 +683,7 @@ function toThreatZone(record: ThreatZoneRecord): ThreatZone {
   return {
     id: record.id,
     center: { lat: record.lat, lng: record.lng },
-    radius: record.radius,
+    radius: record.radius ?? defaultRiskZoneRadiusMeters,
     severity: record.severity,
     confidence: record.confidence ?? defaultThreatConfidence,
     reports: record.reports,
@@ -476,6 +730,7 @@ function SafeRoutePlanner() {
   const mapRef = useRef<google.maps.Map | null>(null);
   const sourceAutocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
   const destinationAutocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
+  const riskLocationAutocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
   const threatZoneCreatedRef = useRef(false);
   const reroutedThreatZonesRef = useRef<Set<string>>(new Set());
   const rerouteInFlightRef = useRef(false);
@@ -486,6 +741,7 @@ function SafeRoutePlanner() {
   const [source, setSource] = useState("");
   const [destination, setDestination] = useState("");
   const [routeCoordinates, setRouteCoordinates] = useState<google.maps.LatLngLiteral[]>([]);
+  const [generatedRoutes, setGeneratedRoutes] = useState<GeneratedRouteOption[]>([]);
   const [routeId, setRouteId] = useState("");
   const [routeSummary, setRouteSummary] = useState<RouteSummary | null>(null);
   const [status, setStatus] = useState<RouteStatus>("idle");
@@ -496,6 +752,13 @@ function SafeRoutePlanner() {
   const [syncStatus, setSyncStatus] = useState("Connecting");
   const [syncError, setSyncError] = useState("");
   const [riskScore, setRiskScore] = useState(0);
+  const [riskReportOpen, setRiskReportOpen] = useState(false);
+  const [riskReportType, setRiskReportType] = useState<RiskReportType>("suspicious");
+  const [riskIssueDetails, setRiskIssueDetails] = useState("");
+  const [riskLocationSource, setRiskLocationSource] = useState<RiskLocationSource>("vehicle");
+  const [riskLocationQuery, setRiskLocationQuery] = useState("");
+  const [selectedRiskLocation, setSelectedRiskLocation] = useState<google.maps.LatLngLiteral | null>(null);
+  const [riskReportMessage, setRiskReportMessage] = useState("");
   const [threatZone, setThreatZone] = useState<ThreatZone | null>(null);
   const [threatZones, setThreatZones] = useState<ThreatZone[]>([]);
   const [incidentMessages, setIncidentMessages] = useState<IncidentMessageRecord[]>([]);
@@ -526,6 +789,27 @@ function SafeRoutePlanner() {
       coordinateCount: routeCoordinates.length,
     };
   }, [routeCoordinates.length, routeSummary]);
+  const routeRiskSummaries = useMemo(
+    () =>
+      generatedRoutes.map((route) => {
+        const risk = calculateRouteRiskScore(route.path, threatZones);
+
+        return {
+          label: route.label,
+          eta: route.durationText,
+          distance: route.distanceText,
+          durationSeconds: route.durationSeconds,
+          risk,
+          riskCategory: getRouteRiskCategory(risk),
+        };
+      }),
+    [generatedRoutes, threatZones]
+  );
+  const recommendedRouteLabel = useMemo(
+    () => getRecommendedRouteLabel(routeRiskSummaries),
+    [routeRiskSummaries]
+  );
+  const selectedRouteLabel = routeRiskSummaries[0]?.label ?? null;
 
   const routeKey = useMemo(() => getRouteKey(source, destination), [destination, source]);
   const displayedVehiclePosition = vehiclePosition;
@@ -548,6 +832,9 @@ function SafeRoutePlanner() {
       )
     : null;
   const activeThreatConfidence = activeThreatZone ? getConfidenceLabel(activeThreatZone.confidence) : null;
+  const activeRiskZoneStyle = activeThreatZone
+    ? getRiskZoneStyle(getRiskZoneLevel(activeThreatZone.severity))
+    : null;
   const upcomingThreatZone = displayedVehiclePosition
     ? relevantThreatZones
         .map((zone) => ({
@@ -562,14 +849,17 @@ function SafeRoutePlanner() {
         .sort((a, b) => a.distance - b.distance)[0]?.zone ?? null
     : null;
   const currentThreatConfidence = threatZone ? getConfidenceLabel(threatZone.confidence) : null;
+  const currentRiskZoneStyle = threatZone
+    ? getRiskZoneStyle(getRiskZoneLevel(threatZone.severity))
+    : null;
   const riskColor =
     riskScore >= 70
       ? "bg-rose-100 text-rose-700"
-      : riskScore >= 40
-        ? "bg-amber-100 text-amber-700"
-        : "bg-emerald-100 text-emerald-700";
+    : riskScore >= 40
+      ? "bg-amber-100 text-amber-700"
+        : "bg-slate-100 text-slate-700";
   const riskTrackColor =
-    riskScore >= 70 ? "bg-red-400" : riskScore >= 40 ? "bg-yellow-300" : "bg-emerald-300";
+    riskScore >= 70 ? "bg-red-400" : riskScore >= 40 ? "bg-yellow-300" : "bg-slate-400";
 
   const vehicleSpeed = useMemo(() => {
     const distanceMeters = routeSummary?.distanceMeters;
@@ -778,6 +1068,19 @@ function SafeRoutePlanner() {
       setRouteId(snapshot.routeId);
       setRouteCoordinates(snapshot.routeCoordinates);
       setRouteSummary(snapshot.routeSummary);
+      setGeneratedRoutes(
+        snapshot.routeCoordinates.length
+          ? [
+              {
+                label: "Route A",
+                path: snapshot.routeCoordinates,
+                distanceText: snapshot.routeSummary?.distanceText ?? "No route",
+                durationSeconds: snapshot.routeSummary?.durationSeconds ?? 0,
+                durationText: snapshot.routeSummary?.durationText ?? "Awaiting route",
+              },
+            ]
+          : []
+      );
       setVehiclePosition(snapshot.vehiclePosition);
       latestVehiclePositionRef.current = snapshot.vehiclePosition;
       vehicleIndexRef.current = snapshot.vehicleIndex;
@@ -876,15 +1179,17 @@ function SafeRoutePlanner() {
       return;
     }
 
-    const zoneCenter = displayedVehiclePosition ?? routeCoordinates[0] ?? defaultCenter;
-    const severity = riskScore >= 80 ? "critical" : "high";
+    const zoneCenter = selectedRiskLocation ?? displayedVehiclePosition ?? routeCoordinates[0] ?? defaultCenter;
+    const riskZoneLevel = getRiskZoneLevelFromScore(riskScore);
+    const severity = riskZoneLevel;
+    const zoneRadius = getRiskZoneRadiusMeters(riskZoneLevel);
     threatZoneCreatedRef.current = true;
     setThreatZoneStatus("Creating threat zone");
 
     createThreatZone({
       lat: zoneCenter.lat,
       lng: zoneCenter.lng,
-      radius: 2000,
+      radius: zoneRadius,
       severity,
       sourceVehicleId: navigationId || undefined,
       routeKey: routeKey || undefined,
@@ -893,7 +1198,7 @@ function SafeRoutePlanner() {
         const nextThreatZone = {
           id,
           center: zoneCenter,
-          radius: 2000,
+          radius: zoneRadius,
           severity,
           confidence: defaultThreatConfidence,
           reports: 1,
@@ -912,7 +1217,7 @@ function SafeRoutePlanner() {
         threatZoneCreatedRef.current = false;
         setThreatZoneStatus(error instanceof Error ? error.message : "Unable to create threat zone");
       });
-  }, [displayedVehiclePosition, navigationId, riskScore, routeCoordinates, routeKey]);
+  }, [displayedVehiclePosition, navigationId, riskScore, routeCoordinates, routeKey, selectedRiskLocation]);
 
   useEffect(() => {
     latestVehiclePositionRef.current = vehiclePosition;
@@ -1030,7 +1335,9 @@ function SafeRoutePlanner() {
 
       const candidatePromises = candidateBearings.map(async (bearing) => {
         const waypoint = getAvoidanceWaypoint(zoneToAvoid, bearing);
-        addAiDecisionLog(`Testing ${bearing}deg avoidance corridor outside ${Math.round(zoneToAvoid.radius)}m zone.`);
+        addAiDecisionLog(
+          `Testing ${bearing}deg avoidance corridor outside ${formatRadiusLabel(zoneToAvoid.radius)} zone.`
+        );
 
         const assessedRoutes = scoreCandidateRoutes(
           await computeRoutes({
@@ -1053,7 +1360,9 @@ function SafeRoutePlanner() {
 
         if (viableRoute.touchesRisk) {
           addAiDecisionLog(
-            `Fallback ${bearing}deg corridor: best path still touches the active 2km zone, keeping as backup only.`
+            `Fallback ${bearing}deg corridor: best path still touches the active ${formatRadiusLabel(
+              zoneToAvoid.radius
+            )} zone, keeping as backup only.`
           );
         } else {
           addAiDecisionLog(
@@ -1077,7 +1386,7 @@ function SafeRoutePlanner() {
         .sort((a, b) => a.score - b.score);
 
       if (!candidates.length) {
-        throw new Error("No safe alternate route found outside current 2km threat zones.");
+        throw new Error("No safe alternate route found outside current risk zones.");
       }
 
       return candidates[0];
@@ -1091,7 +1400,17 @@ function SafeRoutePlanner() {
         const nextVehiclePosition = bestRoute.path[0] ?? rerouteOrigin;
 
         setRouteCoordinates(bestRoute.path);
-        setRouteSummary(formatRouteSummary(bestRoute.distanceMeters, bestRoute.durationSeconds));
+        const bestRouteSummary = formatRouteSummary(bestRoute.distanceMeters, bestRoute.durationSeconds);
+        setRouteSummary(bestRouteSummary);
+        setGeneratedRoutes([
+          {
+            label: "Route A",
+            path: bestRoute.path,
+            distanceText: bestRouteSummary.distanceText,
+            durationSeconds: bestRouteSummary.durationSeconds,
+            durationText: bestRouteSummary.durationText,
+          },
+        ]);
         setRouteId(nextRouteId);
         setVehiclePosition(nextVehiclePosition);
         latestVehiclePositionRef.current = nextVehiclePosition;
@@ -1106,7 +1425,9 @@ function SafeRoutePlanner() {
           )}min`
         );
         addAiDecisionLog(
-          `Committed a short traffic-aware reroute around ${threatDecisionLabel}, outside the active 2km risk radius.`
+          `Committed a short traffic-aware reroute around ${threatDecisionLabel}, outside the active ${formatRadiusLabel(
+            zoneToAvoid.radius
+          )} risk radius.`
         );
         if (navigationId) {
           void updateVehicleNavigationRoute({
@@ -1146,9 +1467,9 @@ function SafeRoutePlanner() {
             const payload = (await response.json()) as { narration?: string };
             const rerouteBriefing =
               payload.narration ||
-              `Rerouting near ${threatLocationLabel}. ${zoneToAvoid.severity} risk reported within ${Math.round(
-                zoneToAvoid.radius / 1000
-              )} kilometers ahead.`;
+              `Rerouting near ${threatLocationLabel}. ${zoneToAvoid.severity} risk reported within ${formatRadiusLabel(
+                zoneToAvoid.radius
+              )} ahead.`;
             setDriverBriefing(rerouteBriefing);
             addAiDecisionLog(`Driver reroute advisory: ${rerouteBriefing}`);
             speakText(rerouteBriefing, zoneToAvoid.id);
@@ -1261,6 +1582,18 @@ function SafeRoutePlanner() {
     }
   }
 
+  function handleMapClick(event: google.maps.MapMouseEvent) {
+    if (!riskReportOpen || riskLocationSource !== "map" || !event.latLng) {
+      return;
+    }
+
+    setSelectedRiskLocation({
+      lat: event.latLng.lat(),
+      lng: event.latLng.lng(),
+    });
+    setRiskReportMessage("Report location selected.");
+  }
+
   function handlePlaceChanged(kind: "source" | "destination") {
     const autocomplete = kind === "source" ? sourceAutocompleteRef.current : destinationAutocompleteRef.current;
     const place = autocomplete?.getPlace();
@@ -1273,11 +1606,58 @@ function SafeRoutePlanner() {
     }
   }
 
-  async function triggerRiskEvent(eventType: RiskEvent) {
-    setRiskScore((currentScore) => Math.min(100, currentScore + riskEvents[eventType].increment));
-    addAiDecisionLog(`${riskEvents[eventType].label} captured for this vehicle.`);
+  function handleRiskLocationPlaceChanged() {
+    const place = riskLocationAutocompleteRef.current?.getPlace();
+    const value = place?.formatted_address || place?.name || "";
+    const location = place?.geometry?.location;
 
-    if (!navigationId || !displayedVehiclePosition || !routeKey) {
+    setRiskLocationQuery(value);
+
+    if (!location) {
+      setSelectedRiskLocation(null);
+      setRiskReportMessage("Choose a suggested location.");
+      return;
+    }
+
+    setSelectedRiskLocation({
+      lat: location.lat(),
+      lng: location.lng(),
+    });
+    setRiskReportMessage("Report location selected.");
+  }
+
+  async function submitRiskReport() {
+    const riskType = riskReportTypes[riskReportType];
+    const reportLocation =
+      riskLocationSource === "vehicle" ? displayedVehiclePosition : selectedRiskLocation;
+
+    if (riskLocationSource === "map" && !selectedRiskLocation) {
+      setRiskReportMessage("Select a location on the map.");
+      return;
+    }
+
+    if (riskLocationSource === "place" && !selectedRiskLocation) {
+      setRiskReportMessage("Choose a suggested location.");
+      return;
+    }
+
+    if (riskLocationSource === "vehicle" && !displayedVehiclePosition) {
+      setRiskReportMessage("Current vehicle location is not available.");
+      return;
+    }
+
+    if (riskLocationSource === "vehicle") {
+      setSelectedRiskLocation(null);
+    }
+
+    setRiskScore((currentScore) => Math.min(100, currentScore + riskReportIncrement));
+    setRiskReportMessage(`${riskType.label} report submitted.`);
+    setRiskReportOpen(false);
+    addAiDecisionLog(
+      `${riskType.label} risk report submitted${riskIssueDetails.trim() ? `: ${riskIssueDetails.trim()}` : "."}`
+    );
+
+    if (!navigationId || !reportLocation || !routeKey) {
       return;
     }
 
@@ -1287,9 +1667,9 @@ function SafeRoutePlanner() {
         routeKey,
         sourceLabel: source,
         destinationLabel: destination,
-        eventType: eventType as IncidentEventType,
-        lat: displayedVehiclePosition.lat,
-        lng: displayedVehiclePosition.lng,
+        eventType: riskType.eventType,
+        lat: reportLocation.lat,
+        lng: reportLocation.lng,
       });
     } catch (error) {
       setIncidentError(error instanceof Error ? error.message : "Unable to publish driver advisory.");
@@ -1353,6 +1733,7 @@ function SafeRoutePlanner() {
     setMessage("Navigation stopped.");
     setRerouteStatus("");
     setRouteCoordinates([]);
+    setGeneratedRoutes([]);
     setRouteSummary(null);
     setRouteId("");
     setVehiclePosition(null);
@@ -1362,6 +1743,12 @@ function SafeRoutePlanner() {
     setVehicleStatus("Awaiting route");
     setNavigationId("");
     setRiskScore(0);
+    setRiskReportOpen(false);
+    setRiskReportMessage("");
+    setRiskIssueDetails("");
+    setRiskLocationQuery("");
+    setSelectedRiskLocation(null);
+    setRiskLocationSource("vehicle");
     setThreatZone(null);
     setThreatVerificationMessage("");
     setDriverBriefing("No active advisories.");
@@ -1399,6 +1786,12 @@ function SafeRoutePlanner() {
     spokenIncidentIdsRef.current.clear();
     spokenThreatZoneIdsRef.current.clear();
     setRiskScore(0);
+    setRiskReportOpen(false);
+    setRiskReportMessage("");
+    setRiskIssueDetails("");
+    setRiskLocationQuery("");
+    setSelectedRiskLocation(null);
+    setRiskLocationSource("vehicle");
     setThreatZone(null);
     setThreatVerificationMessage("");
     setAiDecisionLogs(["Route intelligence initialized. Monitoring Firestore threat zones and traffic-aware alternatives."]);
@@ -1414,7 +1807,7 @@ function SafeRoutePlanner() {
       const routes = await computeRoutes({
         origin: source,
         destination,
-        computeAlternativeRoutes: false,
+        computeAlternativeRoutes: true,
       });
       const primaryRoute = routes[0];
       const path = primaryRoute?.path;
@@ -1450,6 +1843,15 @@ function SafeRoutePlanner() {
       setNavigationId(nextNavigationId);
       setRouteCoordinates(path);
       setRouteSummary(primaryRoute.summary);
+      setGeneratedRoutes(
+        routes.map((route, index) => ({
+          label: `Route ${String.fromCharCode(65 + index)}`,
+          path: route.path,
+          distanceText: route.summary.distanceText,
+          durationSeconds: route.summary.durationSeconds,
+          durationText: route.summary.durationText,
+        }))
+      );
       setRouteId(nextRouteId);
       setStatus("success");
       setMessage("Route rendered correctly.");
@@ -1457,6 +1859,7 @@ function SafeRoutePlanner() {
       mapRef.current?.fitBounds(bounds, 72);
     } catch (error) {
       setRouteCoordinates([]);
+      setGeneratedRoutes([]);
       setRouteSummary(null);
       setRouteId("");
       setVehiclePosition(null);
@@ -1490,48 +1893,92 @@ function SafeRoutePlanner() {
           zoom={routeCoordinates.length ? 11 : 5}
           options={mapOptions}
           onLoad={handleMapLoad}
+          onClick={handleMapClick}
         >
-          {routeCoordinates.length > 0 && (
+          {(generatedRoutes.length > 0 || routeCoordinates.length > 0) && (
             <>
-              <Polyline
-                path={routeCoordinates}
-                options={{
-                  strokeColor: rerouteStatus.includes("Optimized") ? "#22d3ee" : "#14b8a6",
-                  strokeOpacity: 0.92,
-                  strokeWeight: 6,
-                  zIndex: 20,
-                }}
-              />
+              {(generatedRoutes.length
+                ? generatedRoutes
+                : [
+                    {
+                      label: "Route A",
+                      path: routeCoordinates,
+                      distanceText: routeSummary?.distanceText ?? "No route",
+                      durationSeconds: routeSummary?.durationSeconds ?? 0,
+                      durationText: routeSummary?.durationText ?? "Awaiting route",
+                    },
+                  ]
+              ).map((route, index) => {
+                const isSelected = index === 0;
+
+                return (
+                  <Polyline
+                    key={route.label}
+                    path={route.path}
+                    options={{
+                      strokeColor: isSelected
+                        ? rerouteStatus.includes("Optimized")
+                          ? "#22d3ee"
+                          : "#14b8a6"
+                        : "#64748b",
+                      strokeOpacity: isSelected ? 0.95 : 0.48,
+                      strokeWeight: isSelected ? 6 : 4,
+                      zIndex: isSelected ? 24 : 18,
+                    }}
+                  />
+                );
+              })}
               <Marker position={routeCoordinates[0]} label="A" />
               <Marker position={routeCoordinates[routeCoordinates.length - 1]} label="B" />
             </>
           )}
 
           {displayedVehiclePosition && <Marker position={displayedVehiclePosition} icon={truckIcon} zIndex={40} />}
+          {selectedRiskLocation && riskReportOpen && riskLocationSource !== "vehicle" && (
+            <Marker position={selectedRiskLocation} label="!" zIndex={45} />
+          )}
 
-          {threatZones.map((zone) => (
-            <Circle
-              key={zone.id}
-              center={zone.center}
-              radius={zone.radius}
-              options={{
-                fillColor: "#ef4444",
-                fillOpacity: activeThreatZone?.id === zone.id ? 0.32 : 0.18,
-                strokeColor: "#f87171",
-                strokeOpacity: activeThreatZone?.id === zone.id ? 1 : 0.75,
-                strokeWeight: activeThreatZone?.id === zone.id ? 3 : 2,
-                zIndex: 30,
-              }}
-            />
-          ))}
+          {threatZones.map((zone) => {
+            const zoneStyle = getRiskZoneStyle(getRiskZoneLevel(zone.severity));
+
+            return (
+              <Fragment key={zone.id}>
+                <Circle
+                  center={zone.center}
+                  radius={zone.radius}
+                  options={{
+                    fillColor: zoneStyle.mapFill,
+                    fillOpacity: activeThreatZone?.id === zone.id ? 0.32 : 0.18,
+                    strokeColor: zoneStyle.mapStroke,
+                    strokeOpacity: activeThreatZone?.id === zone.id ? 1 : 0.75,
+                    strokeWeight: activeThreatZone?.id === zone.id ? 3 : 2,
+                    zIndex: 30,
+                  }}
+                />
+                <Marker
+                  position={zone.center}
+                  icon={getRiskZoneMarkerIcon(zoneStyle)}
+                  zIndex={activeThreatZone?.id === zone.id ? 46 : 35}
+                />
+              </Fragment>
+            );
+          })}
         </GoogleMap>
       )}
 
       {activeThreatZone && (
         <section className="pointer-events-none absolute inset-x-0 top-[27rem] z-20 px-4 sm:inset-x-auto sm:left-5 sm:top-[430px] sm:w-[420px] sm:p-0">
-          <div className="rounded-lg border border-red-200 bg-white/95 p-4 shadow-2xl shadow-slate-900/25 backdrop-blur-2xl">
+          <div
+            className={`rounded-lg border p-4 shadow-2xl shadow-slate-900/25 backdrop-blur-2xl ${
+              activeRiskZoneStyle?.cardClassName ?? "border-red-300 bg-red-50"
+            }`}
+          >
             <div className="flex items-center gap-3">
-              <span className="flex h-10 w-10 items-center justify-center rounded border border-red-200 bg-red-50 text-red-600">
+              <span
+                className={`flex h-10 w-10 items-center justify-center rounded border ${
+                  activeRiskZoneStyle?.iconClassName ?? "border-red-200 bg-red-50 text-red-600"
+                }`}
+              >
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
                   <path d="M12 9v4" />
@@ -1539,14 +1986,23 @@ function SafeRoutePlanner() {
                 </svg>
               </span>
               <div>
-                <p className="text-sm font-semibold text-slate-900">High Risk Zone Ahead</p>
+                <p className="text-sm font-semibold text-slate-900">
+                  {activeRiskZoneStyle?.label ?? "High Risk"} Zone Ahead
+                </p>
                 <p className="mt-1 text-xs text-slate-600">
-                  {activeThreatZone.severity.toUpperCase()} threat within {Math.round(activeThreatZone.radius / 1000)}km radius
+                  {activeThreatZone.severity.toUpperCase()} threat within {formatRadiusLabel(activeThreatZone.radius)} radius
                 </p>
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                   <span className="font-semibold text-slate-700">Confidence: {activeThreatZone.confidence}%</span>
                   <span className={`rounded border px-2 py-0.5 font-semibold ${activeThreatConfidence?.className}`}>
                     {activeThreatConfidence?.label}
+                  </span>
+                  <span
+                    className={`rounded border px-2 py-0.5 font-semibold ${
+                      activeRiskZoneStyle?.badgeClassName ?? "border-red-200 bg-white text-red-700"
+                    }`}
+                  >
+                    {activeRiskZoneStyle?.label ?? "High Risk"}
                   </span>
                 </div>
                 <p className="mt-1 text-xs font-medium text-slate-500">Verified Reports: {activeThreatZone.reports}</p>
@@ -1719,6 +2175,48 @@ function SafeRoutePlanner() {
                       <p className="mt-1 text-sm font-semibold text-slate-900">{routeMeta.coordinateCount}</p>
                     </div>
                   </div>
+
+                  {routeRiskSummaries.length > 0 && (
+                    <div className="space-y-2">
+                      {routeRiskSummaries.map((route) => {
+                        const isRecommended = route.label === recommendedRouteLabel;
+                        const isSelected = route.label === selectedRouteLabel;
+
+                        return (
+                          <div
+                            key={route.label}
+                            className={`rounded-xl border px-3 py-2 text-xs ${
+                              isSelected
+                                ? "border-teal-300 bg-teal-50 text-slate-700 shadow-sm"
+                                : "border-slate-200 bg-white text-slate-600"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="font-semibold text-slate-900">Route ID: {route.label}</span>
+                              <span>ETA: {route.eta}</span>
+                            </div>
+                            <div className="mt-1 font-medium text-slate-600">Distance: {route.distance}</div>
+                            <div className="mt-1 flex flex-wrap items-center gap-2 font-semibold text-slate-700">
+                              <span>Risk: {route.risk}</span>
+                              <span className={`rounded border px-2 py-0.5 ${route.riskCategory.className}`}>
+                                {route.riskCategory.label}
+                              </span>
+                              {isSelected && (
+                                <span className="rounded border border-teal-200 bg-white px-2 py-0.5 text-teal-700">
+                                  Default Selected
+                                </span>
+                              )}
+                              {isRecommended && (
+                                <span className="rounded border border-sky-200 bg-white px-2 py-0.5 text-sky-700">
+                                  Recommended Route
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -1778,7 +2276,7 @@ function SafeRoutePlanner() {
               >
                 <span>
                   <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">Risk</span>
-                  <span className="mt-1 block text-sm font-semibold text-slate-900">Event Monitor</span>
+                  <span className="mt-1 block text-sm font-semibold text-slate-900">Event Report</span>
                 </span>
                 <div className="flex items-center gap-2">
                   <span className={`rounded px-2 py-1 text-xs font-semibold ${riskColor}`}>{riskScore}/100</span>
@@ -1797,35 +2295,184 @@ function SafeRoutePlanner() {
                     />
                   </div>
 
-                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-                    {(Object.keys(riskEvents) as RiskEvent[]).map((eventType) => (
+                  <div className="mt-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRiskReportOpen((isOpen) => !isOpen);
+                        setRiskReportMessage("");
+                      }}
+                      className="flex h-10 w-full items-center justify-center rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:border-sky-300 hover:bg-sky-50"
+                    >
+                      + Add Risk Report
+                    </button>
+
+                    {riskReportOpen && (
+                      <div className="mt-3 space-y-3 rounded-xl border border-slate-200 bg-white p-3">
+                        <label className="block">
+                          <span className="mb-1.5 block text-[11px] font-medium text-slate-500">Risk Type</span>
+                          <select
+                            value={riskReportType}
+                            onChange={(event) => setRiskReportType(event.target.value as RiskReportType)}
+                            className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-400"
+                          >
+                            {(Object.keys(riskReportTypes) as RiskReportType[]).map((type) => (
+                              <option key={type} value={type}>
+                                {riskReportTypes[type].label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+
+                        <label className="block">
+                          <span className="mb-1.5 block text-[11px] font-medium text-slate-500">Issue Details</span>
+                          <textarea
+                            value={riskIssueDetails}
+                            onChange={(event) => setRiskIssueDetails(event.target.value)}
+                            placeholder="Type the issue manually"
+                            rows={3}
+                            className="w-full resize-none rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none placeholder:text-slate-400 focus:border-sky-400"
+                          />
+                        </label>
+
+                        <div>
+                          <span className="mb-1.5 block text-[11px] font-medium text-slate-500">Location Source</span>
+                          <div className="grid grid-cols-1 gap-2">
+                            <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                              <input
+                                type="radio"
+                                name="risk-location-source"
+                                checked={riskLocationSource === "vehicle"}
+                                onChange={() => {
+                                  setRiskLocationSource("vehicle");
+                                  setSelectedRiskLocation(null);
+                                  setRiskReportMessage("");
+                                }}
+                                className="h-4 w-4 border-slate-300 text-sky-600 focus:ring-sky-500"
+                              />
+                              Use Current Vehicle Location
+                            </label>
+                            <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                              <input
+                                type="radio"
+                                name="risk-location-source"
+                                checked={riskLocationSource === "map"}
+                                onChange={() => {
+                                  setRiskLocationSource("map");
+                                  setSelectedRiskLocation(null);
+                                  setRiskReportMessage("Select a location on the map.");
+                                }}
+                                className="h-4 w-4 border-slate-300 text-sky-600 focus:ring-sky-500"
+                              />
+                              Select Location On Map
+                            </label>
+                            <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                              <input
+                                type="radio"
+                                name="risk-location-source"
+                                checked={riskLocationSource === "place"}
+                                onChange={() => {
+                                  setRiskLocationSource("place");
+                                  setSelectedRiskLocation(null);
+                                  setRiskReportMessage("");
+                                }}
+                                className="h-4 w-4 border-slate-300 text-sky-600 focus:ring-sky-500"
+                              />
+                              Type Location Name
+                            </label>
+                          </div>
+                        </div>
+
+                        {riskLocationSource === "place" && (
+                          <label className="block">
+                            <span className="mb-1.5 block text-[11px] font-medium text-slate-500">Location Name</span>
+                            {isLoaded ? (
+                              <Autocomplete
+                                onLoad={(autocomplete) => {
+                                  riskLocationAutocompleteRef.current = autocomplete;
+                                }}
+                                onPlaceChanged={handleRiskLocationPlaceChanged}
+                              >
+                                <input
+                                  value={riskLocationQuery}
+                                  onChange={(event) => {
+                                    setRiskLocationQuery(event.target.value);
+                                    setSelectedRiskLocation(null);
+                                  }}
+                                  placeholder="Search risk location"
+                                  className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none placeholder:text-slate-400 focus:border-sky-400"
+                                />
+                              </Autocomplete>
+                            ) : (
+                              <input
+                                disabled
+                                placeholder="Loading Places..."
+                                className="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-400"
+                              />
+                            )}
+                          </label>
+                        )}
+
+                        {riskLocationSource === "map" && selectedRiskLocation && (
+                          <p className="text-xs text-slate-500">
+                            Selected: {selectedRiskLocation.lat.toFixed(4)}, {selectedRiskLocation.lng.toFixed(4)}
+                          </p>
+                        )}
+                        {riskLocationSource === "map" && (
+                          <p className="text-xs text-slate-500">
+                            {selectedRiskLocation
+                              ? "Click another point on the map to change this location."
+                              : "Click a point on the map to place the report marker."}
+                          </p>
+                        )}
+                        {riskLocationSource === "place" && selectedRiskLocation && (
+                          <p className="text-xs text-slate-500">
+                            Selected: {selectedRiskLocation.lat.toFixed(4)}, {selectedRiskLocation.lng.toFixed(4)}
+                          </p>
+                        )}
+
                       <button
-                        key={eventType}
                         type="button"
                         onClick={() => {
-                          void triggerRiskEvent(eventType);
+                          void submitRiskReport();
                         }}
-                        className="min-h-9 rounded-xl border border-slate-200 bg-white px-2 py-2 text-xs font-medium text-slate-700 transition hover:border-sky-300 hover:bg-sky-50"
+                          className="h-10 w-full rounded-xl bg-sky-600 px-3 text-sm font-semibold text-white transition hover:bg-sky-500"
                       >
-                        {riskEvents[eventType].label}
+                          Submit Report
                       </button>
-                    ))}
+                      </div>
+                    )}
+
+                    {riskReportMessage && <p className="mt-2 text-xs text-slate-600">{riskReportMessage}</p>}
                   </div>
 
-                  <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
+                  <div
+                    className={`mt-3 rounded-xl border p-3 text-xs text-slate-600 ${
+                      currentRiskZoneStyle?.cardClassName ?? "border-slate-200 bg-slate-50"
+                    }`}
+                  >
                     {threatZone ? (
                       <>
-                        <div>{threatZone.severity.toUpperCase()} zone: 2km radius</div>
+                        <div className="font-semibold text-slate-800">
+                          {currentRiskZoneStyle?.label ?? "High Risk"} zone: {formatRadiusLabel(threatZone.radius)} radius
+                        </div>
                         <div className="mt-2 flex flex-wrap items-center gap-2">
                           <span>Confidence: {threatZone.confidence}%</span>
                           <span className={`rounded border px-2 py-0.5 font-semibold ${currentThreatConfidence?.className}`}>
                             {currentThreatConfidence?.label}
                           </span>
+                          <span
+                            className={`rounded border px-2 py-0.5 font-semibold ${
+                              currentRiskZoneStyle?.badgeClassName ?? "border-red-200 bg-white text-red-700"
+                            }`}
+                          >
+                            {currentRiskZoneStyle?.label ?? "High Risk"}
+                          </span>
                         </div>
                         <div className="mt-1 text-slate-500">Verified Reports: {threatZone.reports}</div>
                       </>
                     ) : (
-                      threatZoneStatus || "Threat zone triggers above 60 risk."
+                      threatZoneStatus || "Risk zone triggers above 60 risk."
                     )}
                     {threatZoneError && <div className="mt-1 break-words text-rose-600">{threatZoneError}</div>}
                   </div>
