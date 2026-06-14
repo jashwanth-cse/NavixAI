@@ -85,7 +85,22 @@ type SafeStop = {
   distanceMeters: number;
   rating?: number;
 };
-type SafeStopSearchType = "police" | "hospital" | "gas_station" | "parking";
+type FuelStop = SafeStop & {
+  type: "Fuel";
+  city?: string;
+  dieselPrice?: number;
+  priceUnavailable?: boolean;
+};
+type DieselPriceLookup = {
+  city: string;
+  dieselPrice: number;
+  cached?: boolean;
+};
+type RouteFuelPriceSummary = {
+  city: string;
+  dieselPrice: number;
+};
+type SafeStopSearchType = "police" | "hospital" | "parking";
 
 const defaultCenter = { lat: 20.5937, lng: 78.9629 };
 const mapOptions: google.maps.MapOptions = {
@@ -126,6 +141,11 @@ const initialThreatConfidence = 25;
 const defaultRiskZoneRadiusMeters = 1000;
 const routeRiskScanMeters = 5000;
 const safeStopsSearchRadiusMeters = 5000;
+const routeFuelSearchRadiusMeters = 4500;
+const maxRouteFuelSearchPoints = 10;
+const fuelAnnouncementDistanceMeters = 2000;
+const fuelComparisonWindowMeters = 5000;
+const meaningfulDieselPriceDifference = 1.5;
 const earthRadiusMeters = 6371000;
 const riskZoneColors = {
   low: "#808080",
@@ -135,7 +155,6 @@ const riskZoneColors = {
 const safeStopSearchTypes: Array<{ type: SafeStopSearchType; label: string }> = [
   { type: "police", label: "Police" },
   { type: "hospital", label: "Hospital" },
-  { type: "gas_station", label: "Fuel" },
   { type: "parking", label: "Truck Parking" },
 ];
 const truckParkingIncludeKeywords = [
@@ -157,6 +176,16 @@ const truckParkingIncludeKeywords = [
   "transport parking",
   "freight terminal parking",
 ];
+const fuelPriceCityAliases: Record<string, string[]> = {
+  bengaluru: ["Bangalore"],
+  gurugram: ["Gurgaon"],
+  prayagraj: ["Allahabad"],
+  thiruvananthapuram: ["Trivandrum"],
+  kozhikode: ["Calicut"],
+  puducherry: ["Pondicherry"],
+  mumbai: ["Bombay"],
+  chennai: ["Chennai"],
+};
 const genericParkingExcludeKeywords = [
   "car parking",
   "bike parking",
@@ -695,8 +724,280 @@ async function fetchSafeStops({
     .slice(0, 8);
 }
 
+function getRouteDistanceMeters(path: google.maps.LatLngLiteral[]) {
+  return path.reduce((total, point, index) => {
+    if (index === 0) {
+      return total;
+    }
+
+    return total + getDistanceMeters(path[index - 1], point);
+  }, 0);
+}
+
+function sampleRoutePoints(path: google.maps.LatLngLiteral[], maxPoints: number) {
+  if (path.length <= maxPoints) {
+    return path;
+  }
+
+  const totalDistance = getRouteDistanceMeters(path);
+  if (!Number.isFinite(totalDistance) || totalDistance <= 0) {
+    return [path[0], path[path.length - 1]];
+  }
+
+  const interval = totalDistance / (maxPoints - 1);
+  const sampledPoints = [path[0]];
+  let nextTargetDistance = interval;
+  let travelledDistance = 0;
+
+  for (let index = 1; index < path.length - 1 && sampledPoints.length < maxPoints - 1; index += 1) {
+    const previousPoint = path[index - 1];
+    const point = path[index];
+    const segmentDistance = getDistanceMeters(previousPoint, point);
+
+    travelledDistance += segmentDistance;
+    if (travelledDistance >= nextTargetDistance) {
+      sampledPoints.push(point);
+      nextTargetDistance += interval;
+    }
+  }
+
+  sampledPoints.push(path[path.length - 1]);
+  return sampledPoints;
+}
+
+function getNearestRouteDistanceMeters(path: google.maps.LatLngLiteral[], point: google.maps.LatLngLiteral) {
+  if (!path.length) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.min(...path.map((routePoint) => getDistanceMeters(routePoint, point)));
+}
+
+async function fetchRouteFuelStops(path: google.maps.LatLngLiteral[]): Promise<FuelStop[]> {
+  if (!path.length) {
+    return [];
+  }
+
+  const { PlacesService, PlacesServiceStatus } = (await google.maps.importLibrary("places")) as google.maps.PlacesLibrary;
+  const service = new PlacesService(document.createElement("div"));
+  const samplePoints = sampleRoutePoints(path, maxRouteFuelSearchPoints);
+
+  const searchAtPoint = (point: google.maps.LatLngLiteral) =>
+    new Promise<FuelStop[]>((resolve, reject) => {
+      service.nearbySearch(
+        {
+          location: new google.maps.LatLng(point.lat, point.lng),
+          radius: routeFuelSearchRadiusMeters,
+          type: "gas_station",
+        },
+        (results, status) => {
+          if (status === PlacesServiceStatus.ZERO_RESULTS) {
+            resolve([]);
+            return;
+          }
+
+          if (status !== PlacesServiceStatus.OK) {
+            reject(new Error("Places Nearby Search failed for fuel stops."));
+            return;
+          }
+
+          resolve(
+            (results ?? [])
+              .map((place) => {
+                const location = place.geometry?.location;
+
+                if (!location || !place.place_id) {
+                  return null;
+                }
+
+                const position = { lat: location.lat(), lng: location.lng() };
+
+                return {
+                  id: place.place_id,
+                  name: place.name ?? "Fuel stop",
+                  type: "Fuel",
+                  lat: position.lat,
+                  lng: position.lng,
+                  distanceMeters: Math.round(getNearestRouteDistanceMeters(path, position)),
+                  ...(typeof place.rating === "number" ? { rating: place.rating } : {}),
+                } satisfies FuelStop;
+              })
+              .filter((stop): stop is FuelStop => stop !== null)
+          );
+        }
+      );
+    });
+
+  const settledResults = await Promise.allSettled(samplePoints.map(searchAtPoint));
+  const rejectedSearch = settledResults.find((result) => result.status === "rejected");
+
+  if (rejectedSearch?.status === "rejected") {
+    throw rejectedSearch.reason instanceof Error
+      ? rejectedSearch.reason
+      : new Error("Unable to fetch fuel stops on this route.");
+  }
+
+  const fuelStopsById = new Map<string, FuelStop>();
+  settledResults.forEach((result) => {
+    if (result.status !== "fulfilled") {
+      return;
+    }
+
+    result.value.forEach((stop) => {
+      const currentStop = fuelStopsById.get(stop.id);
+      if (!currentStop || stop.distanceMeters < currentStop.distanceMeters) {
+        fuelStopsById.set(stop.id, stop);
+      }
+    });
+  });
+
+  return Array.from(fuelStopsById.values())
+    .filter((stop) => stop.distanceMeters <= routeFuelSearchRadiusMeters)
+    .sort((a, b) => a.distanceMeters - b.distanceMeters)
+    .slice(0, 18);
+}
+
+function getCityCandidatesFromGeocoderResults(results: google.maps.GeocoderResult[]) {
+  const preferredTypes = [
+    "locality",
+    "postal_town",
+    "administrative_area_level_3",
+    "administrative_area_level_2",
+    "administrative_area_level_1",
+  ];
+  const candidates: string[] = [];
+
+  for (const type of preferredTypes) {
+    results
+      .flatMap((result) => result.address_components)
+      .filter((component) => component.types.includes(type))
+      .forEach((component) => {
+        if (component.long_name && !candidates.includes(component.long_name)) {
+          candidates.push(component.long_name);
+        }
+      });
+  }
+
+  return candidates;
+}
+
+function getCityFromGeocoderResults(results: google.maps.GeocoderResult[]) {
+  return getCityCandidatesFromGeocoderResults(results)[0] ?? null;
+}
+
+function fetchCityCandidatesForLocation(location: google.maps.LatLngLiteral) {
+  const geocoder = new google.maps.Geocoder();
+
+  return new Promise<string[]>((resolve) => {
+    geocoder.geocode({ location }, (results, status) => {
+      if (status !== "OK" || !results?.length) {
+        resolve([]);
+        return;
+      }
+
+      resolve(getCityCandidatesFromGeocoderResults(results));
+    });
+  });
+}
+
+async function getDieselPriceFromCityCandidates(
+  candidates: string[],
+  getCachedDieselPrice: (city: string) => Promise<DieselPriceLookup>
+) {
+  const expandedCandidates = candidates.flatMap((city) => [
+    city,
+    ...(fuelPriceCityAliases[city.trim().toLowerCase().replace(/[^a-z0-9]+/g, "")] ?? []),
+  ]);
+  const uniqueCandidates = Array.from(new Set(expandedCandidates));
+
+  for (const city of uniqueCandidates) {
+    try {
+      return await getCachedDieselPrice(city);
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function fetchCityForLocation(location: google.maps.LatLngLiteral) {
+  const geocoder = new google.maps.Geocoder();
+
+  return new Promise<string | null>((resolve) => {
+    geocoder.geocode({ location }, (results, status) => {
+      if (status !== "OK" || !results?.length) {
+        resolve(null);
+        return;
+      }
+
+      resolve(getCityFromGeocoderResults(results));
+    });
+  });
+}
+
+async function fetchDieselPrice(city: string): Promise<DieselPriceLookup> {
+  const response = await fetch(`/api/fuel-price?city=${encodeURIComponent(city)}`);
+  const payload = (await response.json()) as Partial<DieselPriceLookup> & { error?: string };
+
+  if (!response.ok || typeof payload.dieselPrice !== "number") {
+    throw new Error(payload.error || "Unable to fetch diesel price.");
+  }
+
+  return {
+    city: payload.city || city,
+    dieselPrice: payload.dieselPrice,
+    cached: payload.cached,
+  };
+}
+
+async function enrichFuelStopsWithCityPrices(
+  stops: FuelStop[],
+  getCachedDieselPrice: (city: string) => Promise<DieselPriceLookup>
+) {
+  return Promise.all(
+    stops.map(async (stop) => {
+      const cityCandidates = await fetchCityCandidatesForLocation({ lat: stop.lat, lng: stop.lng });
+      const price = await getDieselPriceFromCityCandidates(cityCandidates, getCachedDieselPrice);
+
+      if (!price) {
+        return {
+          ...stop,
+          city: cityCandidates[0],
+          priceUnavailable: true,
+        };
+      }
+
+      return {
+        ...stop,
+        city: price.city,
+        dieselPrice: price.dieselPrice,
+        priceUnavailable: false,
+      };
+    })
+  );
+}
+
+function getFuelStopMarkerIcon(dieselPrice?: number): google.maps.Icon {
+  const priceLabel = typeof dieselPrice === "number" ? `Rs ${Math.round(dieselPrice)}` : "Diesel";
+  const svg = encodeURIComponent(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="62" height="44" viewBox="0 0 62 44">
+      <path d="M31 43s16-11.8 16-26A16 16 0 1 0 15 17c0 14.2 16 26 16 26Z" fill="#16a34a" stroke="white" stroke-width="3"/>
+      <rect x="3" y="3" width="56" height="18" rx="8" fill="white" stroke="#16a34a" stroke-width="2"/>
+      <text x="31" y="16" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" font-weight="700" fill="#15803d">${priceLabel}</text>
+      <text x="31" y="31" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="800" fill="white">D</text>
+    </svg>
+  `);
+
+  return {
+    url: `data:image/svg+xml;charset=UTF-8,${svg}`,
+    scaledSize: new google.maps.Size(62, 44),
+    anchor: new google.maps.Point(31, 43),
+  };
+}
+
 function getRecommendedRouteLabel(
-  routes: Array<{ label: string; durationSeconds: number; risk: number }>
+  routes: Array<{ label: string; durationSeconds: number; risk: number; dieselPrice?: number }>
 ) {
   if (!routes.length) {
     return null;
@@ -710,8 +1011,20 @@ function getRecommendedRouteLabel(
     (route) => route.durationSeconds <= reasonableEtaLimitSeconds
   );
   const recommendationPool = reasonableEtaRoutes.length ? reasonableEtaRoutes : candidateRoutes;
+  const fuelPricedRoutes = recommendationPool.filter((route) => typeof route.dieselPrice === "number");
 
-  return [...recommendationPool].sort((a, b) => a.risk - b.risk || a.durationSeconds - b.durationSeconds)[0].label;
+  if (fuelPricedRoutes.length > 1) {
+    return [...fuelPricedRoutes].sort(
+      (a, b) =>
+        (a.dieselPrice ?? Number.POSITIVE_INFINITY) - (b.dieselPrice ?? Number.POSITIVE_INFINITY) ||
+        a.risk - b.risk ||
+        a.durationSeconds - b.durationSeconds
+    )[0].label;
+  }
+
+  return [...recommendationPool].sort(
+    (a, b) => a.risk - b.risk || a.durationSeconds - b.durationSeconds
+  )[0].label;
 }
 
 function getRouteKey(source: string, destination: string) {
@@ -987,6 +1300,12 @@ function SafeRoutePlanner() {
   const [safeStopsLoading, setSafeStopsLoading] = useState(false);
   const [safeStopsError, setSafeStopsError] = useState("");
   const [safeStopsOpen, setSafeStopsOpen] = useState(true);
+  const [fuelStops, setFuelStops] = useState<FuelStop[]>([]);
+  const [fuelStopsLoading, setFuelStopsLoading] = useState(false);
+  const [fuelStopsError, setFuelStopsError] = useState("");
+  const [fuelStopsOpen, setFuelStopsOpen] = useState(true);
+  const [currentDieselPrice, setCurrentDieselPrice] = useState<DieselPriceLookup | null>(null);
+  const [routeFuelPrices, setRouteFuelPrices] = useState<Record<string, RouteFuelPriceSummary>>({});
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceLanguage, setVoiceLanguage] = useState("en-US");
   const [availableVoiceLanguages, setAvailableVoiceLanguages] = useState<string[]>(["en-US"]);
@@ -996,12 +1315,22 @@ function SafeRoutePlanner() {
   const [aiDecisionOpen, setAiDecisionOpen] = useState(false);
   const [convoyModeActive, setConvoyModeActive] = useState(false);
   const [convoyOpen, setConvoyOpen] = useState(true);
+  const [convoyEmergencyActive, setConvoyEmergencyActive] = useState(false);
   const [fleetPartners, setFleetPartners] = useState<TrackedVehicle[]>([]);
   const [aiDecisionLogs, setAiDecisionLogs] = useState<string[]>([
     "Route intelligence standing by. Plan a route to begin monitoring.",
   ]);
   const spokenIncidentIdsRef = useRef<Set<string>>(new Set());
   const spokenThreatZoneIdsRef = useRef<Set<string>>(new Set());
+  const spokenFuelStopIdsRef = useRef<Set<string>>(new Set());
+  const dieselPriceCacheRef = useRef<Map<string, DieselPriceLookup>>(new Map());
+  const lastFuelStopsRouteKeyRef = useRef("");
+  const lastMovingFuelStopsRequestKeyRef = useRef("");
+  const lastDieselGeoKeyRef = useRef("");
+  const lastDieselCityRef = useRef("");
+  const voiceLanguageRef = useRef("en-US");
+  const convoyEmergencyActiveRef = useRef(false);
+  const soundedConvoySosIdsRef = useRef<Set<string>>(new Set());
 
   const convoyModeActiveRef = useRef(convoyModeActive);
 
@@ -1010,7 +1339,13 @@ function SafeRoutePlanner() {
   }, [convoyModeActive]);
 
   useEffect(() => {
+    convoyEmergencyActiveRef.current = convoyEmergencyActive;
+  }, [convoyEmergencyActive]);
+
+  useEffect(() => {
     if (!convoyModeActive && navigationId) {
+      convoyEmergencyActiveRef.current = false;
+      setConvoyEmergencyActive(false);
       void updateVehicleLiveLocation({
         vehicleId: navigationId,
         location: latestVehiclePositionRef.current || routeCoordinates[0] || defaultCenter,
@@ -1039,9 +1374,11 @@ function SafeRoutePlanner() {
           durationSeconds: route.durationSeconds,
           risk,
           riskCategory: getRouteRiskCategory(risk),
+          dieselPrice: routeFuelPrices[route.label]?.dieselPrice,
+          dieselCity: routeFuelPrices[route.label]?.city,
         };
       }),
-    [generatedRoutes, threatZones]
+    [generatedRoutes, routeFuelPrices, threatZones]
   );
   const recommendedRouteLabel = useMemo(
     () => getRecommendedRouteLabel(routeRiskSummaries),
@@ -1223,10 +1560,109 @@ function SafeRoutePlanner() {
     [voiceEnabled, voiceLanguage]
   );
 
+  const playEmergencyBuzzer = useCallback(() => {
+    const AudioContextClass =
+      window.AudioContext ||
+      (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) {
+      return;
+    }
+
+    const audioContext = new AudioContextClass();
+    const gainNode = audioContext.createGain();
+    gainNode.gain.setValueAtTime(0.0001, audioContext.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.35, audioContext.currentTime + 0.03);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + 5);
+    gainNode.connect(audioContext.destination);
+
+    [0, 0.42, 0.84, 1.26, 1.68, 2.1, 2.52, 2.94, 3.36, 3.78, 4.2, 4.62].forEach((offset) => {
+      const oscillator = audioContext.createOscillator();
+      oscillator.type = "square";
+      oscillator.frequency.setValueAtTime(880, audioContext.currentTime + offset);
+      oscillator.connect(gainNode);
+      oscillator.start(audioContext.currentTime + offset);
+      oscillator.stop(audioContext.currentTime + offset + 0.22);
+    });
+
+    window.setTimeout(() => {
+      void audioContext.close();
+    }, 5400);
+  }, []);
+
+  const speakVoiceGuidance = useCallback(
+    async (text: string, speechKey: string) => {
+      if (!voiceEnabled || spokenThreatZoneIdsRef.current.has(speechKey)) {
+        return;
+      }
+
+      try {
+        const response = await fetch("/api/voice-guidance", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text,
+            targetLanguage: voiceLanguage,
+          }),
+        });
+        const payload = (await response.json()) as {
+          audioContent?: string;
+          mimeType?: string;
+          translatedText?: string;
+        };
+
+        if (!response.ok || !payload.audioContent) {
+          speakText(payload.translatedText || text, speechKey);
+          return;
+        }
+
+        window.speechSynthesis?.cancel();
+        const audio = new Audio(`data:${payload.mimeType ?? "audio/mpeg"};base64,${payload.audioContent}`);
+        await audio.play();
+        spokenThreatZoneIdsRef.current.add(speechKey);
+      } catch {
+        speakText(text, speechKey);
+      }
+    },
+    [speakText, voiceEnabled, voiceLanguage]
+  );
+
+  const getCachedDieselPrice = useCallback(async (city: string) => {
+    const normalizedCity = city.trim().toLowerCase();
+    const cached = dieselPriceCacheRef.current.get(normalizedCity);
+
+    if (cached) {
+      return cached;
+    }
+
+    const price = await fetchDieselPrice(city);
+    dieselPriceCacheRef.current.set(normalizedCity, price);
+    return price;
+  }, []);
+
   const saveNavigationSnapshot = useCallback((snapshot: NavigationSnapshot) => {
     window.sessionStorage.setItem(navigationSessionStorageKey, snapshot.navigationId);
     window.sessionStorage.setItem(navigationStateStorageKey, JSON.stringify(snapshot));
   }, []);
+
+  const handleConvoySosToggle = useCallback(async () => {
+    if (!navigationId || !displayedVehiclePosition || !routeKey) {
+      return;
+    }
+
+    const nextEmergencyActive = !convoyEmergencyActiveRef.current;
+    const currentConvoyId = convoyModeActiveRef.current ? `convoy_${routeKey}` : null;
+    convoyEmergencyActiveRef.current = nextEmergencyActive;
+    setConvoyEmergencyActive(nextEmergencyActive);
+
+    await updateVehicleLiveLocation({
+      vehicleId: navigationId,
+      location: displayedVehiclePosition,
+      convoyId: currentConvoyId,
+      status: nextEmergencyActive ? "sos" : "normal",
+    });
+  }, [displayedVehiclePosition, navigationId, routeKey]);
 
   useEffect(() => {
     if (!relevantIncident) {
@@ -1265,23 +1701,6 @@ function SafeRoutePlanner() {
         setDriverBriefing(nextBriefing);
         addAiDecisionLog(`Driver advisory updated: ${nextBriefing}`);
 
-        if (!voiceEnabled || spokenIncidentIdsRef.current.has(incident.id)) {
-          return;
-        }
-
-        const utterance = new SpeechSynthesisUtterance(nextBriefing);
-        const availableVoices = window.speechSynthesis?.getVoices() ?? [];
-        const matchingVoice = findMatchingVoice(availableVoices, voiceLanguage);
-
-        if (matchingVoice) {
-          utterance.voice = matchingVoice;
-          utterance.lang = matchingVoice.lang;
-        } else {
-          utterance.lang = getPrimaryLanguageCode(voiceLanguage);
-        }
-
-        window.speechSynthesis?.cancel();
-        window.speechSynthesis?.speak(utterance);
         spokenIncidentIdsRef.current.add(incident.id);
       } catch {
         if (!isCancelled) {
@@ -1304,6 +1723,10 @@ function SafeRoutePlanner() {
   }, [voiceEnabled]);
 
   useEffect(() => {
+    voiceLanguageRef.current = voiceLanguage;
+  }, [voiceLanguage]);
+
+  useEffect(() => {
     try {
       const rawVoiceSettings = window.localStorage.getItem(voiceSettingsStorageKey);
 
@@ -1321,6 +1744,7 @@ function SafeRoutePlanner() {
       }
 
       if (typeof parsedVoiceSettings.language === "string" && parsedVoiceSettings.language.trim()) {
+        voiceLanguageRef.current = parsedVoiceSettings.language;
         setVoiceLanguage(parsedVoiceSettings.language);
       }
     } catch {
@@ -1427,16 +1851,14 @@ function SafeRoutePlanner() {
       const nextLanguages = Array.from(uniqueLanguagesByCode.values());
 
       if (nextLanguages.length) {
-        setAvailableVoiceLanguages(nextLanguages);
-        setVoiceLanguage((currentLanguage) =>
-          nextLanguages.some(
-            (language) =>
-              language.toLowerCase() === currentLanguage.toLowerCase() ||
-              getPrimaryLanguageCode(language) === getPrimaryLanguageCode(currentLanguage)
-          )
-            ? currentLanguage
-            : nextLanguages[0]
+        const savedLanguage = voiceLanguageRef.current;
+        const includesSavedLanguage = nextLanguages.some(
+          (language) =>
+            language.toLowerCase() === savedLanguage.toLowerCase() ||
+            getPrimaryLanguageCode(language) === getPrimaryLanguageCode(savedLanguage)
         );
+
+        setAvailableVoiceLanguages(includesSavedLanguage ? nextLanguages : [...nextLanguages, savedLanguage]);
       }
     };
 
@@ -1482,6 +1904,23 @@ function SafeRoutePlanner() {
 
     return unsubscribe;
   }, [convoyModeActive, navigationId, routeKey]);
+
+  useEffect(() => {
+    fleetPartners
+      .filter((partner) => partner.status === "sos")
+      .forEach((partner) => {
+        if (soundedConvoySosIdsRef.current.has(partner.vehicleId)) {
+          return;
+        }
+
+        soundedConvoySosIdsRef.current.add(partner.vehicleId);
+        playEmergencyBuzzer();
+      });
+
+    fleetPartners
+      .filter((partner) => partner.status !== "sos")
+      .forEach((partner) => soundedConvoySosIdsRef.current.delete(partner.vehicleId));
+  }, [fleetPartners, playEmergencyBuzzer]);
 
   useEffect(() => {
     if (riskScore <= 60 || threatZoneCreatedRef.current) {
@@ -1586,6 +2025,256 @@ function SafeRoutePlanner() {
   }, [displayedVehiclePosition, isLoaded, rerouteStatus, safeStopsRerouteActive, safeStopsTriggerId]);
 
   useEffect(() => {
+    if (!isLoaded || !navigationId || routeCoordinates.length < 2) {
+      return;
+    }
+
+    const start = routeCoordinates[0];
+    const end = routeCoordinates[routeCoordinates.length - 1];
+    const requestKey = `${navigationId}:${routeCoordinates.length}:${start.lat.toFixed(3)},${start.lng.toFixed(
+      3
+    )}:${end.lat.toFixed(3)},${end.lng.toFixed(3)}`;
+
+    if (lastFuelStopsRouteKeyRef.current === requestKey) {
+      return;
+    }
+
+    let isCancelled = false;
+    lastFuelStopsRouteKeyRef.current = requestKey;
+    setFuelStopsOpen(true);
+    setFuelStopsLoading(true);
+    setFuelStopsError("");
+
+    async function loadRouteFuelStops() {
+      const stops = await fetchRouteFuelStops(routeCoordinates);
+      return enrichFuelStopsWithCityPrices(stops, getCachedDieselPrice);
+    }
+
+    loadRouteFuelStops()
+      .then((stops) => {
+        if (!isCancelled) {
+          setFuelStops(stops);
+        }
+      })
+      .catch((error) => {
+        if (!isCancelled) {
+          setFuelStops([]);
+          setFuelStopsError(error instanceof Error ? error.message : "Unable to fetch fuel stops on this route.");
+        }
+      })
+      .finally(() => {
+        if (!isCancelled) {
+          setFuelStopsLoading(false);
+        }
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [getCachedDieselPrice, isLoaded, navigationId, routeCoordinates]);
+
+  useEffect(() => {
+    if (!isLoaded || !displayedVehiclePosition) {
+      return;
+    }
+
+    const currentPosition = displayedVehiclePosition;
+    const geoKey = `${Math.round(currentPosition.lat * 10) / 10}:${Math.round(currentPosition.lng * 10) / 10}`;
+    if (lastDieselGeoKeyRef.current === geoKey) {
+      return;
+    }
+
+    let isCancelled = false;
+    lastDieselGeoKeyRef.current = geoKey;
+
+    async function loadCurrentCityDieselPrice() {
+      const city = await fetchCityForLocation(currentPosition);
+
+      if (isCancelled || !city) {
+        return;
+      }
+
+      const normalizedCity = city.trim().toLowerCase();
+      if (lastDieselCityRef.current === normalizedCity) {
+        return;
+      }
+
+      lastDieselCityRef.current = normalizedCity;
+
+      try {
+        const price = await getCachedDieselPrice(city);
+        if (!isCancelled) {
+          setCurrentDieselPrice(price);
+        }
+      } catch {
+        if (!isCancelled) {
+          setCurrentDieselPrice(null);
+        }
+      }
+    }
+
+    void loadCurrentCityDieselPrice();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [displayedVehiclePosition, getCachedDieselPrice, isLoaded]);
+
+  useEffect(() => {
+    if (!isLoaded || !navigationId || !displayedVehiclePosition) {
+      return;
+    }
+
+    const currentPosition = displayedVehiclePosition;
+    const movingKey = `${navigationId}:${Math.round(currentPosition.lat * 20) / 20}:${
+      Math.round(currentPosition.lng * 20) / 20
+    }`;
+
+    if (lastMovingFuelStopsRequestKeyRef.current === movingKey) {
+      return;
+    }
+
+    let isCancelled = false;
+    lastMovingFuelStopsRequestKeyRef.current = movingKey;
+
+    async function loadMovingFuelStops() {
+      const stops = await fetchRouteFuelStops([currentPosition]);
+      const enrichedStops = await enrichFuelStopsWithCityPrices(stops, getCachedDieselPrice);
+
+      if (isCancelled || !enrichedStops.length) {
+        return;
+      }
+
+      setFuelStops((currentStops) => {
+        const stopsById = new Map<string, FuelStop>();
+
+        currentStops.forEach((stop) => stopsById.set(stop.id, stop));
+        enrichedStops.forEach((stop) => {
+          const currentStop = stopsById.get(stop.id);
+          if (!currentStop || stop.distanceMeters < currentStop.distanceMeters || !currentStop.dieselPrice) {
+            stopsById.set(stop.id, stop);
+          }
+        });
+
+        return Array.from(stopsById.values())
+          .sort((a, b) => a.distanceMeters - b.distanceMeters)
+          .slice(0, 24);
+      });
+    }
+
+    void loadMovingFuelStops();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [displayedVehiclePosition, getCachedDieselPrice, isLoaded, navigationId]);
+
+  useEffect(() => {
+    if (!isLoaded || !generatedRoutes.length) {
+      setRouteFuelPrices({});
+      return;
+    }
+
+    let isCancelled = false;
+
+    async function loadRouteFuelPrices() {
+      const entries = await Promise.all(
+        generatedRoutes.map(async (route) => {
+          const midpoint = route.path[Math.floor(route.path.length / 2)];
+
+          if (!midpoint) {
+            return null;
+          }
+
+          const city = await fetchCityForLocation(midpoint);
+
+          if (!city) {
+            return null;
+          }
+
+          try {
+            const price = await getCachedDieselPrice(city);
+            return [route.label, { city: price.city, dieselPrice: price.dieselPrice }] as const;
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      if (isCancelled) {
+        return;
+      }
+
+      setRouteFuelPrices(
+        Object.fromEntries(entries.filter((entry): entry is [string, RouteFuelPriceSummary] => entry !== null))
+      );
+    }
+
+    void loadRouteFuelPrices();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [generatedRoutes, getCachedDieselPrice, isLoaded]);
+
+  useEffect(() => {
+    if (!voiceEnabled || !displayedVehiclePosition || !fuelStops.length) {
+      return;
+    }
+
+    const nearbyFuelStops = fuelStops
+      .map((stop) => ({
+        stop,
+        distanceMeters: getDistanceMeters(displayedVehiclePosition, { lat: stop.lat, lng: stop.lng }),
+      }))
+      .filter(({ distanceMeters }) => distanceMeters <= fuelComparisonWindowMeters)
+      .sort((a, b) => a.distanceMeters - b.distanceMeters);
+    const nextFuelStop = nearbyFuelStops.find(
+      ({ stop, distanceMeters }) =>
+        distanceMeters <= fuelAnnouncementDistanceMeters && !spokenFuelStopIdsRef.current.has(stop.id)
+    );
+
+    if (!nextFuelStop) {
+      return;
+    }
+
+    const cheaperNearbyStop = nearbyFuelStops.find(
+      ({ stop, distanceMeters }) =>
+        stop.id !== nextFuelStop.stop.id &&
+        distanceMeters > nextFuelStop.distanceMeters &&
+        typeof stop.dieselPrice === "number" &&
+        typeof nextFuelStop.stop.dieselPrice === "number" &&
+        nextFuelStop.stop.dieselPrice - stop.dieselPrice >= meaningfulDieselPriceDifference
+    );
+    const priceText =
+      typeof nextFuelStop.stop.dieselPrice === "number"
+        ? ` Diesel is Rs ${nextFuelStop.stop.dieselPrice.toFixed(2)} per litre.`
+        : "";
+    const comparisonText = cheaperNearbyStop
+      ? ` Another fuel station ahead has diesel Rs ${cheaperNearbyStop.stop.dieselPrice?.toFixed(2)} per litre.`
+      : "";
+    const englishMessage = `Fuel station ahead in ${Math.max(
+      1,
+      Math.round(nextFuelStop.distanceMeters / 1000)
+    )} kilometers.${priceText}${comparisonText}`;
+    const fuelSpeechKey = `fuel:${nextFuelStop.stop.id}`;
+    let isCancelled = false;
+    spokenFuelStopIdsRef.current.add(nextFuelStop.stop.id);
+
+    async function speakFuelAdvisory() {
+      if (!isCancelled) {
+        await speakVoiceGuidance(englishMessage, fuelSpeechKey);
+      }
+    }
+
+    void speakFuelAdvisory();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [displayedVehiclePosition, fuelStops, speakVoiceGuidance, voiceEnabled]);
+
+  useEffect(() => {
     if (!navigationId) {
       return;
     }
@@ -1603,7 +2292,7 @@ function SafeRoutePlanner() {
           vehicleId: navigationId,
           location: latestPosition,
           convoyId: currentConvoyId,
-          status: "normal",
+          status: convoyEmergencyActiveRef.current ? "sos" : "normal",
         });
 
         setSyncStatus("Live");
@@ -1777,6 +2466,12 @@ function SafeRoutePlanner() {
             durationText: bestRouteSummary.durationText,
           },
         ]);
+        lastFuelStopsRouteKeyRef.current = "";
+        lastMovingFuelStopsRequestKeyRef.current = "";
+        setFuelStops([]);
+        setFuelStopsError("");
+        setFuelStopsLoading(false);
+        setRouteFuelPrices({});
         setRouteId(nextRouteId);
         setVehiclePosition(nextVehiclePosition);
         latestVehiclePositionRef.current = nextVehiclePosition;
@@ -1838,12 +2533,10 @@ function SafeRoutePlanner() {
               )} ahead.`;
             setDriverBriefing(rerouteBriefing);
             addAiDecisionLog(`Driver reroute advisory: ${rerouteBriefing}`);
-            speakText(rerouteBriefing, zoneToAvoid.id);
           })
           .catch(() => {
             const rerouteBriefing = `Rerouting near ${threatLocationLabel}. ${zoneToAvoid.severity} risk reported ahead.`;
             setDriverBriefing(rerouteBriefing);
-            speakText(rerouteBriefing, zoneToAvoid.id);
           });
         mapRef.current?.fitBounds(bounds, 72);
       })
@@ -2099,6 +2792,9 @@ function SafeRoutePlanner() {
     reroutedThreatZonesRef.current.clear();
     spokenIncidentIdsRef.current.clear();
     spokenThreatZoneIdsRef.current.clear();
+    spokenFuelStopIdsRef.current.clear();
+    convoyEmergencyActiveRef.current = false;
+    setConvoyEmergencyActive(false);
     window.speechSynthesis?.cancel();
     setStatus("idle");
     setMessage("Navigation stopped.");
@@ -2127,6 +2823,15 @@ function SafeRoutePlanner() {
     setSafeStopsError("");
     setSafeStopsLoading(false);
     lastSafeStopsRequestKeyRef.current = "";
+    setFuelStops([]);
+    setFuelStopsError("");
+    setFuelStopsLoading(false);
+    setRouteFuelPrices({});
+    setCurrentDieselPrice(null);
+    lastFuelStopsRouteKeyRef.current = "";
+    lastMovingFuelStopsRequestKeyRef.current = "";
+    lastDieselGeoKeyRef.current = "";
+    lastDieselCityRef.current = "";
     setAiDecisionLogs(["Navigation stopped. Session document removed from Firestore."]);
     window.sessionStorage.removeItem(navigationSessionStorageKey);
     window.sessionStorage.removeItem(navigationStateStorageKey);
@@ -2160,6 +2865,9 @@ function SafeRoutePlanner() {
     threatZoneCreatedRef.current = false;
     spokenIncidentIdsRef.current.clear();
     spokenThreatZoneIdsRef.current.clear();
+    spokenFuelStopIdsRef.current.clear();
+    convoyEmergencyActiveRef.current = false;
+    setConvoyEmergencyActive(false);
     setRiskScore(0);
     setRiskReportOpen(false);
     setRiskReportMessage("");
@@ -2173,6 +2881,15 @@ function SafeRoutePlanner() {
     setSafeStopsError("");
     setSafeStopsLoading(false);
     lastSafeStopsRequestKeyRef.current = "";
+    setFuelStops([]);
+    setFuelStopsError("");
+    setFuelStopsLoading(false);
+    setRouteFuelPrices({});
+    setCurrentDieselPrice(null);
+    lastFuelStopsRouteKeyRef.current = "";
+    lastMovingFuelStopsRequestKeyRef.current = "";
+    lastDieselGeoKeyRef.current = "";
+    lastDieselCityRef.current = "";
     setAiDecisionLogs(["Route intelligence initialized. Monitoring Firestore threat zones and traffic-aware alternatives."]);
     reroutedThreatZonesRef.current.clear();
     rerouteInFlightRef.current = false;
@@ -2246,6 +2963,15 @@ function SafeRoutePlanner() {
       setSafeStopsError("");
       setSafeStopsLoading(false);
       lastSafeStopsRequestKeyRef.current = "";
+      setFuelStops([]);
+      setFuelStopsError("");
+      setFuelStopsLoading(false);
+      setRouteFuelPrices({});
+      setCurrentDieselPrice(null);
+      lastFuelStopsRouteKeyRef.current = "";
+      lastMovingFuelStopsRequestKeyRef.current = "";
+      lastDieselGeoKeyRef.current = "";
+      lastDieselCityRef.current = "";
       latestVehiclePositionRef.current = null;
       vehicleIndexRef.current = 0;
       setVehicleIndex(0);
@@ -2322,7 +3048,7 @@ function SafeRoutePlanner() {
           {convoyModeActive && displayedVehiclePosition && fleetPartners.map((partner) => {
             const partnerPos = { lat: partner.lat, lng: partner.lng };
             const dist = getDistanceMeters(displayedVehiclePosition, partnerPos);
-            const isDistress = partner.status !== "normal";
+            const isDistress = partner.status === "sos";
             const tetherColor = isDistress 
               ? "#ef4444" 
               : dist <= 1500 
@@ -2382,13 +3108,25 @@ function SafeRoutePlanner() {
             );
           })}
 
-          {safeStops.map((stop) => (
+          {shouldShowSafeStops && safeStops.map((stop) => (
             <Marker
               key={stop.id}
               position={{ lat: stop.lat, lng: stop.lng }}
               icon={getSafeStopMarkerIcon(stop.type)}
               title={`${stop.name} - ${stop.type}`}
               zIndex={38}
+            />
+          ))}
+
+          {fuelStops.map((stop) => (
+            <Marker
+              key={`fuel-${stop.id}`}
+              position={{ lat: stop.lat, lng: stop.lng }}
+              icon={getFuelStopMarkerIcon(stop.dieselPrice)}
+              title={`${stop.name} - diesel ${
+                typeof stop.dieselPrice === "number" ? `Rs ${stop.dieselPrice.toFixed(2)}/L` : "price loading"
+              }`}
+              zIndex={37}
             />
           ))}
         </GoogleMap>
@@ -2629,6 +3367,12 @@ function SafeRoutePlanner() {
                               <span className={`rounded border px-2 py-0.5 ${route.riskCategory.className}`}>
                                 {route.riskCategory.label}
                               </span>
+                              {typeof route.dieselPrice === "number" && (
+                                <span className="rounded border border-green-200 bg-green-50 px-2 py-0.5 text-green-700">
+                                  Diesel: Rs {route.dieselPrice.toFixed(2)}/L
+                                  {route.dieselCity ? ` - ${route.dieselCity}` : ""}
+                                </span>
+                              )}
                               {isSelected && (
                                 <span className="rounded border border-teal-200 bg-white px-2 py-0.5 text-teal-700">
                                   Default Selected
@@ -2637,6 +3381,11 @@ function SafeRoutePlanner() {
                               {isRecommended && (
                                 <span className="rounded border border-sky-200 bg-white px-2 py-0.5 text-sky-700">
                                   Recommended Route
+                                </span>
+                              )}
+                              {isRecommended && typeof route.dieselPrice === "number" && (
+                                <span className="rounded border border-green-200 bg-white px-2 py-0.5 text-green-700">
+                                  Fuel Efficient
                                 </span>
                               )}
                             </div>
@@ -2690,6 +3439,21 @@ function SafeRoutePlanner() {
 
                   {convoyModeActive && (
                     <div className="space-y-3 rounded-xl border border-slate-100 bg-slate-50/30 p-2.5 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleConvoySosToggle();
+                        }}
+                        disabled={!navigationId || !displayedVehiclePosition}
+                        className={`flex h-10 w-full items-center justify-center gap-2 rounded-xl border px-3 text-xs font-bold uppercase transition disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400 ${
+                          convoyEmergencyActive
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                            : "border-rose-300 bg-rose-600 text-white shadow-sm shadow-rose-600/20 hover:bg-rose-500"
+                        }`}
+                      >
+                        {convoyEmergencyActive ? "Resolve SOS Alarm" : "SOS Alarm"}
+                      </button>
+
                       {fleetPartners.length === 0 ? (
                         <div className="flex items-center justify-center gap-2 py-3 text-slate-500">
                           <svg className="h-4 w-4 animate-spin text-sky-600" viewBox="0 0 24 24" fill="none">
@@ -2707,7 +3471,7 @@ function SafeRoutePlanner() {
                               const partnerDist = displayedVehiclePosition 
                                 ? getDistanceMeters(displayedVehiclePosition, partnerPos) 
                                 : 0;
-                              const isDistress = partner.status !== "normal";
+                              const isAtRisk = partner.status === "sos";
 
                               return (
                                 <div
@@ -2722,12 +3486,12 @@ function SafeRoutePlanner() {
                                   </div>
                                   <span
                                     className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase ${
-                                      isDistress
+                                      isAtRisk
                                         ? "bg-rose-100 text-rose-700 border border-rose-200"
                                         : "bg-emerald-100 text-emerald-700 border border-emerald-200"
                                     }`}
                                   >
-                                    {isDistress ? partner.status : "Secure"}
+                                    {isAtRisk ? "At Risk" : "Secure"}
                                   </span>
                                 </div>
                               );
@@ -2738,67 +3502,23 @@ function SafeRoutePlanner() {
                             <div className="flex items-center justify-between">
                               <span className="font-semibold text-slate-600">Wireless Safety Tether:</span>
                               {(() => {
-                                const distances = fleetPartners.map(p => 
-                                  displayedVehiclePosition ? getDistanceMeters(displayedVehiclePosition, { lat: p.lat, lng: p.lng }) : 0
-                                );
-                                const maxDist = distances.length ? Math.max(...distances) : 0;
-                                const hasDistress = fleetPartners.some(p => p.status !== "normal");
+                                const hasDistress = convoyEmergencyActive || fleetPartners.some(p => p.status === "sos");
 
                                 if (hasDistress) {
                                   return (
                                     <span className="rounded bg-rose-500 px-2 py-0.5 font-bold text-white uppercase animate-pulse">
-                                      Distress Alarm
-                                    </span>
-                                  );
-                                }
-                                if (maxDist <= 1500) {
-                                  return (
-                                    <span className="rounded bg-cyan-100 border border-cyan-200 px-2 py-0.5 font-bold text-cyan-700 uppercase">
-                                      Secure
-                                    </span>
-                                  );
-                                }
-                                if (maxDist <= 3000) {
-                                  return (
-                                    <span className="rounded bg-amber-100 border border-amber-200 px-2 py-0.5 font-bold text-amber-700 uppercase">
-                                      Stretched
+                                      At Risk
                                     </span>
                                   );
                                 }
                                 return (
-                                  <span className="rounded bg-rose-100 border border-rose-200 px-2 py-0.5 font-bold text-rose-700 uppercase animate-pulse">
-                                    Vulnerable
+                                  <span className="rounded bg-cyan-100 border border-cyan-200 px-2 py-0.5 font-bold text-cyan-700 uppercase">
+                                    Secure
                                   </span>
                                 );
                               })()}
                             </div>
                           </div>
-
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              const partner = fleetPartners[0];
-                              if (!partner) return;
-                              const currentConvoyId = `convoy_${routeKey}`;
-                              const isCurrentlyDistress = partner.status !== "normal";
-
-                              await updateVehicleLiveLocation({
-                                vehicleId: partner.vehicleId,
-                                location: { lat: partner.lat, lng: partner.lng },
-                                convoyId: currentConvoyId,
-                                status: isCurrentlyDistress ? "normal" : "door",
-                              });
-                            }}
-                            className={`mt-2 flex h-9 w-full items-center justify-center gap-2 rounded-xl border px-3 text-xs font-semibold transition ${
-                              fleetPartners.some(p => p.status !== "normal")
-                                ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
-                                : "border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100"
-                            }`}
-                          >
-                            {fleetPartners.some(p => p.status !== "normal")
-                              ? "Resolve Partner Anomaly"
-                              : "Simulate Partner Anomaly (Door Open)"}
-                          </button>
                         </>
                       )}
                     </div>
@@ -2853,6 +3573,95 @@ function SafeRoutePlanner() {
                 </div>
               )}
             </div>
+
+            {navigationId && (
+              <div className="rounded-2xl border border-green-200 bg-white/85 p-3">
+                <button
+                  type="button"
+                  onClick={() => setFuelStopsOpen((isOpen) => !isOpen)}
+                  className="flex w-full items-center justify-between gap-3 text-left"
+                >
+                  <span>
+                    <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-green-700/80">
+                      Diesel
+                    </span>
+                    <span className="mt-1 block text-sm font-semibold text-slate-900">
+                      Fuel stops on route
+                    </span>
+                  </span>
+                  <div className="flex items-center gap-2">
+                    {currentDieselPrice && (
+                      <span className="rounded border border-green-200 bg-green-50 px-2 py-1 text-xs font-semibold text-green-700">
+                        Rs {currentDieselPrice.dieselPrice.toFixed(2)}/L
+                      </span>
+                    )}
+                    <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-green-700">
+                      {fuelStopsOpen ? "Hide" : "Open"}
+                    </span>
+                  </div>
+                </button>
+
+                {fuelStopsOpen && (
+                  <div className="mt-3">
+                    {fuelStopsLoading && (
+                      <div className="flex items-center gap-2 rounded-xl border border-green-100 bg-green-50 px-3 py-2 text-xs font-medium text-green-700">
+                        <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                          <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                        </svg>
+                        Finding diesel stops on this route
+                      </div>
+                    )}
+
+                    {!fuelStopsLoading && fuelStopsError && (
+                      <p className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+                        {fuelStopsError}
+                      </p>
+                    )}
+
+                    {!fuelStopsLoading && !fuelStopsError && fuelStops.length === 0 && (
+                      <p className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-600">
+                        No diesel stops found on this route.
+                      </p>
+                    )}
+
+                    {!fuelStopsLoading && !fuelStopsError && fuelStops.length > 0 && (
+                      <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
+                        {fuelStops.map((stop) => (
+                          <div
+                            key={stop.id}
+                            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="truncate font-semibold text-slate-900">{stop.name}</p>
+                                <p className="mt-1 font-medium text-green-700">
+                                  {stop.city
+                                    ? `Price area: ${stop.city}`
+                                    : stop.priceUnavailable
+                                      ? "Diesel price unavailable"
+                                      : "Checking diesel price"}
+                                </p>
+                              </div>
+                              <span className="shrink-0 rounded border border-green-200 bg-green-50 px-2 py-0.5 font-semibold text-green-700">
+                                {typeof stop.dieselPrice === "number"
+                                  ? `Rs ${stop.dieselPrice.toFixed(2)}/L`
+                                  : stop.priceUnavailable
+                                    ? "No price"
+                                    : formatSafeStopDistance(stop.distanceMeters)}
+                              </span>
+                            </div>
+                            <p className="mt-1 text-slate-500">
+                              Route distance: {formatSafeStopDistance(stop.distanceMeters)}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             {shouldShowSafeStops && (
               <div className="rounded-2xl border border-emerald-200 bg-white/85 p-3">

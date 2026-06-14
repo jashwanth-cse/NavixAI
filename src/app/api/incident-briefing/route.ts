@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
 type IncidentBriefingRequest = {
-  kind?: "incident" | "reroute";
+  kind?: "incident" | "reroute" | "fuel";
+  message?: string;
   eventType?: string;
   sourceLabel?: string;
   destinationLabel?: string;
@@ -38,6 +39,10 @@ function buildFallbackNarration({
   radiusKm,
   locationLabel,
 }: IncidentBriefingRequest) {
+  if (kind === "fuel") {
+    return "Fuel station ahead in 2 kilometers.";
+  }
+
   const routeText =
     sourceLabel && destinationLabel
       ? ` on the ${sourceLabel} to ${destinationLabel} corridor`
@@ -115,9 +120,11 @@ export async function POST(request: NextRequest) {
   }
 
   const prompt = [
-    payload.kind === "reroute"
-      ? "Write one short, calm navigation reroute message for a truck driver in English."
-      : "Rewrite this fleet incident into one short, calm navigation message for a truck driver in English.",
+    payload.kind === "fuel"
+      ? "Rewrite this fuel stop advisory into one short, calm navigation message for a truck driver in English."
+      : payload.kind === "reroute"
+        ? "Write one short, calm navigation reroute message for a truck driver in English."
+        : "Rewrite this fleet incident into one short, calm navigation message for a truck driver in English.",
     "Keep it under 28 words.",
     "Do not mention AI, databases, Firestore, JSON, or internal system details.",
     "Sound like professional in-cab guidance.",
@@ -132,6 +139,7 @@ export async function POST(request: NextRequest) {
     `Threat radius km: ${payload.radiusKm ?? 2}`,
     `Threat latitude: ${payload.lat ?? "unknown"}`,
     `Threat longitude: ${payload.lng ?? "unknown"}`,
+    `Fuel advisory: ${payload.message ?? "unknown"}`,
   ].join("\n");
 
   try {
