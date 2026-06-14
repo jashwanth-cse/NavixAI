@@ -11,6 +11,7 @@ import {
   runTransaction,
   serverTimestamp,
   setDoc,
+  where,
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 
@@ -65,6 +66,8 @@ export type TrackedVehicle = {
   vehicleId: string;
   lat: number;
   lng: number;
+  status: string;
+  convoyId: string | null;
 };
 
 export type ThreatZoneInput = {
@@ -133,17 +136,55 @@ export async function writeTestDocument(): Promise<string> {
 export async function updateVehicleLiveLocation({
   vehicleId,
   location,
+  convoyId,
+  status,
 }: {
   vehicleId: string;
   location: VehicleLocation;
+  convoyId?: string | null;
+  status?: string;
 }) {
   await setDoc(
     doc(db, "vehicles", vehicleId),
     {
       lat: location.lat,
       lng: location.lng,
+      ...(convoyId !== undefined ? { convoyId } : {}),
+      ...(status !== undefined ? { status } : {}),
     },
     { merge: true }
+  );
+}
+
+export function subscribeToConvoyVehicles(
+  convoyId: string,
+  onVehiclesChange: (vehicles: TrackedVehicle[]) => void,
+  onError?: (error: Error) => void
+) {
+  return onSnapshot(
+    query(collection(db, "vehicles"), where("convoyId", "==", convoyId)),
+    (snapshot) => {
+      const vehicles = snapshot.docs
+        .map((vehicleDoc): TrackedVehicle | null => {
+          const data = vehicleDoc.data();
+          if (typeof data.lat !== "number" || typeof data.lng !== "number") {
+            return null;
+          }
+          return {
+            vehicleId: vehicleDoc.id,
+            lat: data.lat,
+            lng: data.lng,
+            status: typeof data.status === "string" ? data.status : "normal",
+            convoyId: typeof data.convoyId === "string" ? data.convoyId : convoyId,
+          };
+        })
+        .filter((v): v is TrackedVehicle => v !== null);
+
+      onVehiclesChange(vehicles);
+    },
+    (error) => {
+      onError?.(error);
+    }
   );
 }
 
@@ -207,6 +248,8 @@ export function subscribeToVehicle(
         vehicleId: typeof data.vehicleId === "string" ? data.vehicleId : vehicleId,
         lat,
         lng,
+        status: typeof data.status === "string" ? data.status : "normal",
+        convoyId: typeof data.convoyId === "string" ? data.convoyId : null,
       });
     },
     (error) => {

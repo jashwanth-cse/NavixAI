@@ -23,6 +23,8 @@ import {
   updateVehicleNavigationRoute,
   updateVehicleLiveLocation,
   verifyThreatZone,
+  subscribeToConvoyVehicles,
+  TrackedVehicle,
 } from "@/services/firestore";
 
 const googleMapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
@@ -992,11 +994,31 @@ function SafeRoutePlanner() {
   const [advisoryOpen, setAdvisoryOpen] = useState(true);
   const [riskOpen, setRiskOpen] = useState(false);
   const [aiDecisionOpen, setAiDecisionOpen] = useState(false);
+  const [convoyModeActive, setConvoyModeActive] = useState(false);
+  const [convoyOpen, setConvoyOpen] = useState(true);
+  const [fleetPartners, setFleetPartners] = useState<TrackedVehicle[]>([]);
   const [aiDecisionLogs, setAiDecisionLogs] = useState<string[]>([
     "Route intelligence standing by. Plan a route to begin monitoring.",
   ]);
   const spokenIncidentIdsRef = useRef<Set<string>>(new Set());
   const spokenThreatZoneIdsRef = useRef<Set<string>>(new Set());
+
+  const convoyModeActiveRef = useRef(convoyModeActive);
+
+  useEffect(() => {
+    convoyModeActiveRef.current = convoyModeActive;
+  }, [convoyModeActive]);
+
+  useEffect(() => {
+    if (!convoyModeActive && navigationId) {
+      void updateVehicleLiveLocation({
+        vehicleId: navigationId,
+        location: latestVehiclePositionRef.current || routeCoordinates[0] || defaultCenter,
+        convoyId: null,
+        status: "normal",
+      }).catch(() => undefined);
+    }
+  }, [convoyModeActive, navigationId, routeCoordinates]);
 
   const routeMeta = useMemo(() => {
     return {
@@ -1118,6 +1140,40 @@ function SafeRoutePlanner() {
           <rect x="8" y="18" width="22" height="14" rx="3" fill="#22d3ee"/>
           <path d="M30 22h7l5 6v4H30V22Z" fill="#14b8a6"/>
           <path d="M34 24h3.2l2.4 3H34v-3Z" fill="#dcfbff"/>
+          <circle cx="15" cy="34" r="4" fill="#081318"/>
+          <circle cx="36" cy="34" r="4" fill="#081318"/>
+          <circle cx="15" cy="34" r="1.7" fill="#e6fbff"/>
+          <circle cx="36" cy="34" r="1.7" fill="#e6fbff"/>
+        </g>
+      </svg>
+    `);
+
+    return {
+      url: `data:image/svg+xml;charset=UTF-8,${svg}`,
+      scaledSize: new google.maps.Size(42, 42),
+      anchor: new google.maps.Point(21, 34),
+    };
+  }, [isLoaded]);
+
+  const getPartnerTruckIcon = useCallback((status: string) => {
+    if (!isLoaded) {
+      return undefined;
+    }
+
+    const isDistress = status !== "normal";
+    const bodyColor = isDistress ? "#f87171" : "#fbbf24";
+    const cabColor = isDistress ? "#dc2626" : "#d97706";
+    const windowColor = isDistress ? "#fee2e2" : "#fffbeb";
+
+    const svg = encodeURIComponent(`
+      <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+        <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+          <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000000" flood-opacity="0.45"/>
+        </filter>
+        <g filter="url(#shadow)">
+          <rect x="8" y="18" width="22" height="14" rx="3" fill="${bodyColor}"/>
+          <path d="M30 22h7l5 6v4H30V22Z" fill="${cabColor}"/>
+          <path d="M34 24h3.2l2.4 3H34v-3Z" fill="${windowColor}"/>
           <circle cx="15" cy="34" r="4" fill="#081318"/>
           <circle cx="36" cy="34" r="4" fill="#081318"/>
           <circle cx="15" cy="34" r="1.7" fill="#e6fbff"/>
@@ -1407,6 +1463,27 @@ function SafeRoutePlanner() {
   }, []);
 
   useEffect(() => {
+    if (!convoyModeActive || !navigationId || !routeKey) {
+      setFleetPartners([]);
+      return;
+    }
+
+    const currentConvoyId = `convoy_${routeKey}`;
+    const unsubscribe = subscribeToConvoyVehicles(
+      currentConvoyId,
+      (vehicles) => {
+        const partners = vehicles.filter((v) => v.vehicleId !== navigationId);
+        setFleetPartners(partners);
+      },
+      (error) => {
+        console.error("Convoy subscription error:", error);
+      }
+    );
+
+    return unsubscribe;
+  }, [convoyModeActive, navigationId, routeKey]);
+
+  useEffect(() => {
     if (riskScore <= 60 || threatZoneCreatedRef.current) {
       return;
     }
@@ -1521,10 +1598,14 @@ function SafeRoutePlanner() {
       }
 
       try {
+        const currentConvoyId = convoyModeActiveRef.current ? `convoy_${routeKey}` : null;
         await updateVehicleLiveLocation({
           vehicleId: navigationId,
           location: latestPosition,
+          convoyId: currentConvoyId,
+          status: "normal",
         });
+
         setSyncStatus("Live");
         setSyncError("");
       } catch (error) {
@@ -1536,7 +1617,7 @@ function SafeRoutePlanner() {
     const timer = window.setInterval(syncLiveLocation, vehicleLiveLocationSyncMs);
 
     return () => window.clearInterval(timer);
-  }, [navigationId]);
+  }, [navigationId, routeKey, routeCoordinates]);
 
   useEffect(() => {
     if (
@@ -2236,6 +2317,41 @@ function SafeRoutePlanner() {
           )}
 
           {displayedVehiclePosition && <Marker position={displayedVehiclePosition} icon={truckIcon} zIndex={40} />}
+
+          {/* Convoy Partner Trucks and Tether Lines */}
+          {convoyModeActive && displayedVehiclePosition && fleetPartners.map((partner) => {
+            const partnerPos = { lat: partner.lat, lng: partner.lng };
+            const dist = getDistanceMeters(displayedVehiclePosition, partnerPos);
+            const isDistress = partner.status !== "normal";
+            const tetherColor = isDistress 
+              ? "#ef4444" 
+              : dist <= 1500 
+                ? "#22d3ee" 
+                : dist <= 3000 
+                  ? "#fbbf24" 
+                  : "#ef4444";
+
+            return (
+              <Fragment key={partner.vehicleId}>
+                <Polyline
+                  path={[displayedVehiclePosition, partnerPos]}
+                  options={{
+                    strokeColor: tetherColor,
+                    strokeOpacity: 0.85,
+                    strokeWeight: 3,
+                    zIndex: 38,
+                    geodesic: true,
+                  }}
+                />
+                <Marker
+                  position={partnerPos}
+                  icon={getPartnerTruckIcon(partner.status)}
+                  zIndex={41}
+                  title={`Convoy Partner: ${partner.vehicleId}`}
+                />
+              </Fragment>
+            );
+          })}
           {selectedRiskLocation && riskReportOpen && riskLocationSource !== "vehicle" && (
             <Marker position={selectedRiskLocation} label="!" zIndex={45} />
           )}
@@ -2527,6 +2643,164 @@ function SafeRoutePlanner() {
                           </div>
                         );
                       })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Virtual Security Convoy Card */}
+            <div className="rounded-2xl border border-slate-200 bg-white/80 p-3">
+              <button
+                type="button"
+                onClick={() => setConvoyOpen((isOpen) => !isOpen)}
+                className="flex w-full items-center justify-between gap-3 text-left"
+              >
+                <span>
+                  <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">
+                    Virtual Security Convoy
+                  </span>
+                  <span className="mt-1 block text-sm font-semibold text-slate-900">
+                    Dynamic fleet safety matching
+                  </span>
+                </span>
+                <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-sky-700">
+                  {convoyOpen ? "Hide" : "Open"}
+                </span>
+              </button>
+
+              {convoyOpen && (
+                <div className="mt-3 space-y-3">
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/50 p-2.5">
+                    <span className="text-xs font-semibold text-slate-700">Convoy Safety System</span>
+                    <button
+                      type="button"
+                      onClick={() => setConvoyModeActive(!convoyModeActive)}
+                      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                        convoyModeActive ? "bg-sky-600" : "bg-slate-200"
+                      }`}
+                    >
+                      <span
+                        className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                          convoyModeActive ? "translate-x-5" : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {convoyModeActive && (
+                    <div className="space-y-3 rounded-xl border border-slate-100 bg-slate-50/30 p-2.5 text-xs">
+                      {fleetPartners.length === 0 ? (
+                        <div className="flex items-center justify-center gap-2 py-3 text-slate-500">
+                          <svg className="h-4 w-4 animate-spin text-sky-600" viewBox="0 0 24 24" fill="none">
+                            <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                            <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                          </svg>
+                          <span>Awaiting fleet partners...</span>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="space-y-2">
+                            <p className="font-semibold text-slate-700">Active Convoy Members</p>
+                            {fleetPartners.map((partner) => {
+                              const partnerPos = { lat: partner.lat, lng: partner.lng };
+                              const partnerDist = displayedVehiclePosition 
+                                ? getDistanceMeters(displayedVehiclePosition, partnerPos) 
+                                : 0;
+                              const isDistress = partner.status !== "normal";
+
+                              return (
+                                <div
+                                  key={partner.vehicleId}
+                                  className="flex items-center justify-between gap-3 border-b border-slate-100 pb-2 last:border-0 last:pb-0"
+                                >
+                                  <div>
+                                    <span className="font-bold text-slate-800">
+                                      {partner.vehicleId.includes("_partner") ? "Truck Beta (Partner)" : partner.vehicleId.slice(0, 12)}
+                                    </span>
+                                    <span className="ml-2 text-slate-500">({Math.round(partnerDist)}m away)</span>
+                                  </div>
+                                  <span
+                                    className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase ${
+                                      isDistress
+                                        ? "bg-rose-100 text-rose-700 border border-rose-200"
+                                        : "bg-emerald-100 text-emerald-700 border border-emerald-200"
+                                    }`}
+                                  >
+                                    {isDistress ? partner.status : "Secure"}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          <div className="border-t border-slate-100 pt-2.5">
+                            <div className="flex items-center justify-between">
+                              <span className="font-semibold text-slate-600">Wireless Safety Tether:</span>
+                              {(() => {
+                                const distances = fleetPartners.map(p => 
+                                  displayedVehiclePosition ? getDistanceMeters(displayedVehiclePosition, { lat: p.lat, lng: p.lng }) : 0
+                                );
+                                const maxDist = distances.length ? Math.max(...distances) : 0;
+                                const hasDistress = fleetPartners.some(p => p.status !== "normal");
+
+                                if (hasDistress) {
+                                  return (
+                                    <span className="rounded bg-rose-500 px-2 py-0.5 font-bold text-white uppercase animate-pulse">
+                                      Distress Alarm
+                                    </span>
+                                  );
+                                }
+                                if (maxDist <= 1500) {
+                                  return (
+                                    <span className="rounded bg-cyan-100 border border-cyan-200 px-2 py-0.5 font-bold text-cyan-700 uppercase">
+                                      Secure
+                                    </span>
+                                  );
+                                }
+                                if (maxDist <= 3000) {
+                                  return (
+                                    <span className="rounded bg-amber-100 border border-amber-200 px-2 py-0.5 font-bold text-amber-700 uppercase">
+                                      Stretched
+                                    </span>
+                                  );
+                                }
+                                return (
+                                  <span className="rounded bg-rose-100 border border-rose-200 px-2 py-0.5 font-bold text-rose-700 uppercase animate-pulse">
+                                    Vulnerable
+                                  </span>
+                                );
+                              })()}
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const partner = fleetPartners[0];
+                              if (!partner) return;
+                              const currentConvoyId = `convoy_${routeKey}`;
+                              const isCurrentlyDistress = partner.status !== "normal";
+
+                              await updateVehicleLiveLocation({
+                                vehicleId: partner.vehicleId,
+                                location: { lat: partner.lat, lng: partner.lng },
+                                convoyId: currentConvoyId,
+                                status: isCurrentlyDistress ? "normal" : "door",
+                              });
+                            }}
+                            className={`mt-2 flex h-9 w-full items-center justify-center gap-2 rounded-xl border px-3 text-xs font-semibold transition ${
+                              fleetPartners.some(p => p.status !== "normal")
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                                : "border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100"
+                            }`}
+                          >
+                            {fleetPartners.some(p => p.status !== "normal")
+                              ? "Resolve Partner Anomaly"
+                              : "Simulate Partner Anomaly (Door Open)"}
+                          </button>
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
