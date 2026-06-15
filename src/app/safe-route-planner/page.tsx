@@ -978,13 +978,11 @@ async function enrichFuelStopsWithCityPrices(
   );
 }
 
-function getFuelStopMarkerIcon(dieselPrice?: number): google.maps.Icon {
-  const priceLabel = typeof dieselPrice === "number" ? `Rs ${Math.round(dieselPrice)}` : "Diesel";
+function getFuelStopMarkerIcon(): google.maps.Icon {
   const svg = encodeURIComponent(`
     <svg xmlns="http://www.w3.org/2000/svg" width="62" height="44" viewBox="0 0 62 44">
       <path d="M31 43s16-11.8 16-26A16 16 0 1 0 15 17c0 14.2 16 26 16 26Z" fill="#16a34a" stroke="white" stroke-width="3"/>
       <rect x="3" y="3" width="56" height="18" rx="8" fill="white" stroke="#16a34a" stroke-width="2"/>
-      <text x="31" y="16" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" font-weight="700" fill="#15803d">${priceLabel}</text>
       <text x="31" y="31" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="800" fill="white">D</text>
     </svg>
   `);
@@ -993,6 +991,7 @@ function getFuelStopMarkerIcon(dieselPrice?: number): google.maps.Icon {
     url: `data:image/svg+xml;charset=UTF-8,${svg}`,
     scaledSize: new google.maps.Size(62, 44),
     anchor: new google.maps.Point(31, 43),
+    labelOrigin: new google.maps.Point(31, 13),
   };
 }
 
@@ -3122,11 +3121,20 @@ function SafeRoutePlanner() {
             <Marker
               key={`fuel-${stop.id}`}
               position={{ lat: stop.lat, lng: stop.lng }}
-              icon={getFuelStopMarkerIcon(stop.dieselPrice)}
+              icon={getFuelStopMarkerIcon()}
+              label={{
+                text: typeof stop.dieselPrice === "number" ? `Rs ${Math.round(stop.dieselPrice)}` : "D",
+                color: "#15803d",
+                fontSize: "10px",
+                fontWeight: "800",
+              }}
               title={`${stop.name} - diesel ${
                 typeof stop.dieselPrice === "number" ? `Rs ${stop.dieselPrice.toFixed(2)}/L` : "price loading"
               }`}
-              zIndex={37}
+              options={{
+                optimized: false,
+                zIndex: 42,
+              }}
             />
           ))}
         </GoogleMap>
