@@ -9,7 +9,7 @@ import {
   Polyline,
   useJsApiLoader,
 } from "@react-google-maps/api";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IncidentEventType,
   IncidentMessageRecord,
@@ -22,6 +22,9 @@ import {
   subscribeToThreatZones,
   updateVehicleNavigationRoute,
   updateVehicleLiveLocation,
+  verifyThreatZone,
+  subscribeToConvoyVehicles,
+  TrackedVehicle,
 } from "@/services/firestore";
 
 const googleMapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
@@ -29,12 +32,17 @@ const libraries: "places"[] = ["places"];
 
 type RouteStatus = "idle" | "loading" | "success" | "error";
 type VehicleStatus = "Awaiting route" | "In transit" | "Arrived";
-type RiskEvent = "door" | "stop" | "deviation";
+type RiskReportType = "suspicious" | "nails" | "unsafe";
+type RiskLocationSource = "vehicle" | "map" | "place";
+type RiskZoneLevel = "low" | "medium" | "high";
 type ThreatZone = {
   id: string;
   center: google.maps.LatLngLiteral;
   radius: number;
   severity: string;
+  confidence: number;
+  reports: number;
+  verifiedBy: string[];
   sourceVehicleId?: string;
   routeKey?: string;
 };
@@ -42,6 +50,13 @@ type RouteSummary = {
   distanceMeters: number;
   durationSeconds: number;
   distanceText: string;
+  durationText: string;
+};
+type GeneratedRouteOption = {
+  label: string;
+  path: google.maps.LatLngLiteral[];
+  distanceText: string;
+  durationSeconds: number;
   durationText: string;
 };
 type NavigationSnapshot = {
@@ -61,6 +76,31 @@ type CandidateRoute = {
   distanceMeters: number;
   score: number;
 };
+type SafeStop = {
+  id: string;
+  name: string;
+  type: string;
+  lat: number;
+  lng: number;
+  distanceMeters: number;
+  rating?: number;
+};
+type FuelStop = SafeStop & {
+  type: "Fuel";
+  city?: string;
+  dieselPrice?: number;
+  priceUnavailable?: boolean;
+};
+type DieselPriceLookup = {
+  city: string;
+  dieselPrice: number;
+  cached?: boolean;
+};
+type RouteFuelPriceSummary = {
+  city: string;
+  dieselPrice: number;
+};
+type SafeStopSearchType = "police" | "hospital" | "parking";
 
 const defaultCenter = { lat: 20.5937, lng: 78.9629 };
 const mapOptions: google.maps.MapOptions = {
@@ -89,16 +129,85 @@ const vehicleMoveIntervalMs = 850;
 const vehicleLiveLocationSyncMs = 5000;
 const navigationSessionStorageKey = "navix-active-navigation-id";
 const navigationStateStorageKey = "navix-active-navigation-state";
+const voiceSettingsStorageKey = "navix-voice-settings";
 const threatApproachBufferMeters = 0;
 const avoidanceBufferMeters = 250;
 const candidateBearings = [0, 45, 90, 135, 180, 225, 270, 315];
 const maxDecisionLogs = 14;
 const routeFields = ["path", "durationMillis", "distanceMeters", "localizedValues"];
-const riskEvents: Record<RiskEvent, { label: string; increment: number }> = {
-  door: { label: "Trigger Door Open", increment: 18 },
-  stop: { label: "Trigger Stop", increment: 24 },
-  deviation: { label: "Trigger Deviation", increment: 35 },
+const defaultThreatConfidence = 35;
+const initialThreatReports = 1;
+const initialThreatConfidence = 25;
+const defaultRiskZoneRadiusMeters = 1000;
+const routeRiskScanMeters = 5000;
+const safeStopsSearchRadiusMeters = 5000;
+const routeFuelSearchRadiusMeters = 4500;
+const maxRouteFuelSearchPoints = 10;
+const fuelAnnouncementDistanceMeters = 2000;
+const fuelComparisonWindowMeters = 5000;
+const meaningfulDieselPriceDifference = 1.5;
+const earthRadiusMeters = 6371000;
+const riskZoneColors = {
+  low: "#808080",
+  medium: "#FFA500",
+  high: "#FF0000",
+} satisfies Record<RiskZoneLevel, string>;
+const safeStopSearchTypes: Array<{ type: SafeStopSearchType; label: string }> = [
+  { type: "police", label: "Police" },
+  { type: "hospital", label: "Hospital" },
+  { type: "parking", label: "Truck Parking" },
+];
+const truckParkingIncludeKeywords = [
+  "truck parking",
+  "truck lay-by",
+  "truck layby",
+  "truck rest area",
+  "truck stop",
+  "freight parking",
+  "freight parking area",
+  "logistics hub parking",
+  "lorry parking",
+  "lorry lay-by",
+  "lorry layby",
+  "hgv parking",
+  "heavy vehicle parking",
+  "goods vehicle parking",
+  "commercial vehicle parking",
+  "transport parking",
+  "freight terminal parking",
+];
+const fuelPriceCityAliases: Record<string, string[]> = {
+  bengaluru: ["Bangalore"],
+  gurugram: ["Gurgaon"],
+  prayagraj: ["Allahabad"],
+  thiruvananthapuram: ["Trivandrum"],
+  kozhikode: ["Calicut"],
+  puducherry: ["Pondicherry"],
+  mumbai: ["Bombay"],
+  chennai: ["Chennai"],
 };
+const genericParkingExcludeKeywords = [
+  "car parking",
+  "bike parking",
+  "bicycle parking",
+  "two wheeler parking",
+  "2 wheeler parking",
+  "public parking",
+  "public parking lot",
+  "shopping mall parking",
+  "mall parking",
+  "parking garage",
+  "parking lot",
+  "multi level parking",
+  "multilevel parking",
+  "paid parking",
+];
+const riskReportTypes: Record<RiskReportType, { label: string; eventType: IncidentEventType }> = {
+  suspicious: { label: "Suspicious Activity", eventType: "deviation" },
+  nails: { label: "Nails on Road", eventType: "stop" },
+  unsafe: { label: "Unsafe Area", eventType: "door" },
+};
+const riskReportIncrement = 70;
 
 function createRouteId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -121,7 +230,6 @@ function getFutureDepartureTime() {
 }
 
 function getDistanceMeters(start: google.maps.LatLngLiteral, end: google.maps.LatLngLiteral) {
-  const earthRadiusMeters = 6371000;
   const startLat = (start.lat * Math.PI) / 180;
   const endLat = (end.lat * Math.PI) / 180;
   const deltaLat = ((end.lat - start.lat) * Math.PI) / 180;
@@ -132,6 +240,53 @@ function getDistanceMeters(start: google.maps.LatLngLiteral, end: google.maps.La
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
   return earthRadiusMeters * c;
+}
+
+function getBearingRadians(start: google.maps.LatLngLiteral, end: google.maps.LatLngLiteral) {
+  const startLat = (start.lat * Math.PI) / 180;
+  const endLat = (end.lat * Math.PI) / 180;
+  const deltaLng = ((end.lng - start.lng) * Math.PI) / 180;
+  const y = Math.sin(deltaLng) * Math.cos(endLat);
+  const x =
+    Math.cos(startLat) * Math.sin(endLat) -
+    Math.sin(startLat) * Math.cos(endLat) * Math.cos(deltaLng);
+
+  return Math.atan2(y, x);
+}
+
+function getPointToGeodesicSegmentDistanceMeters(
+  point: google.maps.LatLngLiteral,
+  segmentStart: google.maps.LatLngLiteral,
+  segmentEnd: google.maps.LatLngLiteral
+) {
+  const segmentLengthMeters = getDistanceMeters(segmentStart, segmentEnd);
+
+  if (segmentLengthMeters === 0) {
+    return getDistanceMeters(point, segmentStart);
+  }
+
+  const angularDistanceStartToPoint = getDistanceMeters(segmentStart, point) / earthRadiusMeters;
+  const bearingStartToPoint = getBearingRadians(segmentStart, point);
+  const bearingStartToEnd = getBearingRadians(segmentStart, segmentEnd);
+  const crossTrackAngularDistance = Math.asin(
+    Math.sin(angularDistanceStartToPoint) * Math.sin(bearingStartToPoint - bearingStartToEnd)
+  );
+  const alongTrackAngularDistance = Math.acos(
+    Math.min(
+      1,
+      Math.max(
+        -1,
+        Math.cos(angularDistanceStartToPoint) / Math.cos(crossTrackAngularDistance)
+      )
+    )
+  );
+  const alongTrackMeters = alongTrackAngularDistance * earthRadiusMeters;
+
+  if (!Number.isFinite(alongTrackMeters) || alongTrackMeters < 0 || alongTrackMeters > segmentLengthMeters) {
+    return Math.min(getDistanceMeters(point, segmentStart), getDistanceMeters(point, segmentEnd));
+  }
+
+  return Math.abs(crossTrackAngularDistance) * earthRadiusMeters;
 }
 
 function toLatLngLiteral(point: google.maps.LatLngLiteral | google.maps.LatLng | { lat: number; lng: number }) {
@@ -242,6 +397,635 @@ function getMinimumZoneClearanceMeters(path: google.maps.LatLngLiteral[], zones:
   );
 }
 
+function getRouteZoneClearanceMeters(path: google.maps.LatLngLiteral[], zone: ThreatZone) {
+  if (!path.length) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  if (path.length === 1) {
+    return getDistanceMeters(path[0], zone.center) - zone.radius;
+  }
+
+  let clearanceMeters = Number.POSITIVE_INFINITY;
+
+  for (let index = 1; index < path.length; index += 1) {
+    const segmentClearance =
+      getPointToGeodesicSegmentDistanceMeters(zone.center, path[index - 1], path[index]) - zone.radius;
+    clearanceMeters = Math.min(clearanceMeters, segmentClearance);
+  }
+
+  return clearanceMeters;
+}
+
+function getThreatExposureWeight(clearanceMeters: number) {
+  if (clearanceMeters <= 0) {
+    return 1.15;
+  }
+
+  if (clearanceMeters <= 500) {
+    return 1;
+  }
+
+  if (clearanceMeters <= 1000) {
+    return 0.65;
+  }
+
+  if (clearanceMeters <= routeRiskScanMeters) {
+    return 0.65 * (1 - (clearanceMeters - 1000) / (routeRiskScanMeters - 1000));
+  }
+
+  return 0;
+}
+
+function calculateRouteRiskScore(path: google.maps.LatLngLiteral[], zones: ThreatZone[]) {
+  if (!path.length || !zones.length) {
+    return 0;
+  }
+
+  const exposedConfidence = zones.reduce((highestConfidence, zone) => {
+    const clearanceMeters = getRouteZoneClearanceMeters(path, zone);
+    const exposureWeight = getThreatExposureWeight(clearanceMeters);
+
+    if (exposureWeight <= 0) {
+      return highestConfidence;
+    }
+
+    return Math.max(highestConfidence, zone.confidence);
+  }, 0);
+
+  return Math.min(100, Math.max(0, Math.round(exposedConfidence)));
+}
+
+function getRouteRiskCategory(risk: number) {
+  if (risk <= 25) {
+    return {
+      label: "Low Risk",
+      className: "border-[#808080]/40 bg-[#808080]/10 text-[#808080]",
+    };
+  }
+
+  if (risk <= 75) {
+    return {
+      label: "Medium Risk",
+      className: "border-[#FFA500]/45 bg-[#FFA500]/10 text-[#B36B00]",
+    };
+  }
+
+  return {
+    label: "High Risk",
+    className: "border-[#FF0000]/35 bg-[#FF0000]/10 text-[#FF0000]",
+  };
+}
+
+function getRiskZoneLevelFromConfidence(confidence: number): RiskZoneLevel {
+  if (confidence <= 25) {
+    return "low";
+  }
+
+  if (confidence <= 75) {
+    return "medium";
+  }
+
+  return "high";
+}
+
+function getRiskZoneLevelFromReports(reports: number): RiskZoneLevel {
+  if (reports <= 2) {
+    return "low";
+  }
+
+  if (reports < 5) {
+    return "medium";
+  }
+
+  return "high";
+}
+
+function getThreatConfidenceFromReports(reports: number) {
+  const level = getRiskZoneLevelFromReports(reports);
+
+  if (level === "low") {
+    return 25;
+  }
+
+  if (level === "medium") {
+    return 60;
+  }
+
+  return 85;
+}
+
+function getRiskZoneRadiusMeters(level: RiskZoneLevel) {
+  switch (level) {
+    case "low":
+      return 300;
+    case "medium":
+      return 700;
+    case "high":
+    default:
+      return defaultRiskZoneRadiusMeters;
+  }
+}
+
+function formatRadiusLabel(radiusMeters: number) {
+  if (radiusMeters >= 1000) {
+    return `${Number.isInteger(radiusMeters / 1000) ? radiusMeters / 1000 : (radiusMeters / 1000).toFixed(1)} km`;
+  }
+
+  return `${Math.round(radiusMeters)} m`;
+}
+
+function formatSafeStopDistance(distanceMeters: number) {
+  if (distanceMeters >= 1000) {
+    return `${(distanceMeters / 1000).toFixed(1)} km`;
+  }
+
+  return `${Math.max(1, Math.round(distanceMeters))} m`;
+}
+
+function getRiskZoneStyle(level: RiskZoneLevel) {
+  switch (level) {
+    case "low":
+      return {
+        label: "Low Risk",
+        color: riskZoneColors.low,
+        mapFill: riskZoneColors.low,
+        mapStroke: riskZoneColors.low,
+        cardClassName: "border-slate-300 bg-slate-50",
+        iconClassName: "border-[#808080]/40 bg-[#808080]/10 text-[#808080]",
+        badgeClassName: "border-[#808080]/40 bg-[#808080]/10 text-[#808080]",
+        markerFill: riskZoneColors.low,
+      };
+    case "medium":
+      return {
+        label: "Medium Risk",
+        color: riskZoneColors.medium,
+        mapFill: riskZoneColors.medium,
+        mapStroke: riskZoneColors.medium,
+        cardClassName: "border-[#FFA500]/45 bg-[#FFA500]/10",
+        iconClassName: "border-[#FFA500]/45 bg-[#FFA500]/10 text-[#B36B00]",
+        badgeClassName: "border-[#FFA500]/45 bg-[#FFA500]/10 text-[#B36B00]",
+        markerFill: riskZoneColors.medium,
+      };
+    case "high":
+    default:
+      return {
+        label: "High Risk",
+        color: riskZoneColors.high,
+        mapFill: riskZoneColors.high,
+        mapStroke: riskZoneColors.high,
+        cardClassName: "border-[#FF0000]/35 bg-[#FF0000]/10",
+        iconClassName: "border-[#FF0000]/35 bg-[#FF0000]/10 text-[#FF0000]",
+        badgeClassName: "border-[#FF0000]/35 bg-[#FF0000]/10 text-[#FF0000]",
+        markerFill: riskZoneColors.high,
+      };
+  }
+}
+
+function getRiskZoneMarkerIcon(style: ReturnType<typeof getRiskZoneStyle>): google.maps.Icon {
+  const svg = encodeURIComponent(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="34" height="42" viewBox="0 0 34 42">
+      <path d="M17 41s14-13.2 14-24A14 14 0 1 0 3 17c0 10.8 14 24 14 24Z" fill="${style.markerFill}" stroke="white" stroke-width="3"/>
+      <path d="M17 9.5 24.4 23H9.6L17 9.5Z" fill="white" opacity="0.95"/>
+      <path d="M17 14.2v4.9" stroke="${style.markerFill}" stroke-width="2.2" stroke-linecap="round"/>
+      <circle cx="17" cy="22.5" r="1.3" fill="${style.markerFill}"/>
+    </svg>
+  `);
+
+  return {
+    url: `data:image/svg+xml;charset=UTF-8,${svg}`,
+    scaledSize: new google.maps.Size(34, 42),
+    anchor: new google.maps.Point(17, 41),
+  };
+}
+
+function getSafeStopMarkerIcon(type: string): google.maps.Icon {
+  const fill = type === "Hospital" ? "#0f766e" : type === "Police" ? "#2563eb" : type === "Fuel" ? "#16a34a" : "#7c3aed";
+  const label = type === "Hospital" ? "H" : type === "Police" ? "P" : type === "Fuel" ? "F" : "S";
+  const svg = encodeURIComponent(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="32" height="40" viewBox="0 0 32 40">
+      <path d="M16 39s12-11.4 12-23A12 12 0 1 0 4 16c0 11.6 12 23 12 23Z" fill="${fill}" stroke="white" stroke-width="3"/>
+      <circle cx="16" cy="16" r="7" fill="white" opacity="0.96"/>
+      <text x="16" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" font-weight="700" fill="${fill}">${label}</text>
+    </svg>
+  `);
+
+  return {
+    url: `data:image/svg+xml;charset=UTF-8,${svg}`,
+    scaledSize: new google.maps.Size(32, 40),
+    anchor: new google.maps.Point(16, 39),
+  };
+}
+
+function getSafeStopSearchText(place: google.maps.places.PlaceResult) {
+  return [place.name, ...(place.types ?? [])]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .replace(/[_-]+/g, " ")
+    .toLowerCase();
+}
+
+function isTruckRelevantParking(place: google.maps.places.PlaceResult) {
+  const searchText = getSafeStopSearchText(place);
+  const hasTruckSignal = truckParkingIncludeKeywords.some((keyword) => searchText.includes(keyword));
+
+  if (!hasTruckSignal) {
+    return false;
+  }
+
+  return !genericParkingExcludeKeywords.some((keyword) => searchText.includes(keyword));
+}
+
+async function fetchSafeStops({
+  lat,
+  lng,
+}: {
+  lat: number;
+  lng: number;
+}): Promise<SafeStop[]> {
+  const { PlacesService, PlacesServiceStatus } = (await google.maps.importLibrary("places")) as google.maps.PlacesLibrary;
+  const origin = new google.maps.LatLng(lat, lng);
+  const service = new PlacesService(document.createElement("div"));
+
+  const searchByType = ({ type, label }: { type: SafeStopSearchType; label: string }) =>
+    new Promise<SafeStop[]>((resolve, reject) => {
+      service.nearbySearch(
+        {
+          location: origin,
+          radius: safeStopsSearchRadiusMeters,
+          type,
+        },
+        (results, status) => {
+          if (status === PlacesServiceStatus.ZERO_RESULTS) {
+            resolve([]);
+            return;
+          }
+
+          if (status !== PlacesServiceStatus.OK) {
+            reject(new Error(`Places Nearby Search failed for ${label.toLowerCase()}.`));
+            return;
+          }
+
+          resolve(
+            (results ?? [])
+              .filter((place) => type !== "parking" || isTruckRelevantParking(place))
+              .map((place) => {
+                const location = place.geometry?.location;
+
+                if (!location || !place.place_id) {
+                  return null;
+                }
+
+                const position = { lat: location.lat(), lng: location.lng() };
+
+                return {
+                  id: place.place_id,
+                  name: place.name ?? label,
+                  type: label,
+                  lat: position.lat,
+                  lng: position.lng,
+                  distanceMeters: Math.round(getDistanceMeters({ lat, lng }, position)),
+                  ...(typeof place.rating === "number" ? { rating: place.rating } : {}),
+                };
+              })
+              .filter((stop): stop is SafeStop => stop !== null)
+          );
+        }
+      );
+    });
+
+  const settledResults = await Promise.allSettled(safeStopSearchTypes.map(searchByType));
+  const rejectedSearch = settledResults.find((result) => result.status === "rejected");
+
+  if (rejectedSearch?.status === "rejected") {
+    throw rejectedSearch.reason instanceof Error
+      ? rejectedSearch.reason
+      : new Error("Unable to fetch nearby safe stops.");
+  }
+
+  const safeStopsById = new Map<string, SafeStop>();
+
+  settledResults.forEach((result) => {
+    if (result.status !== "fulfilled") {
+      return;
+    }
+
+    result.value.forEach((stop) => {
+      const currentStop = safeStopsById.get(stop.id);
+      if (!currentStop || stop.distanceMeters < currentStop.distanceMeters) {
+        safeStopsById.set(stop.id, stop);
+      }
+    });
+  });
+
+  return Array.from(safeStopsById.values())
+    .filter((stop) => stop.distanceMeters <= safeStopsSearchRadiusMeters)
+    .sort((a, b) => a.distanceMeters - b.distanceMeters)
+    .slice(0, 8);
+}
+
+function getRouteDistanceMeters(path: google.maps.LatLngLiteral[]) {
+  return path.reduce((total, point, index) => {
+    if (index === 0) {
+      return total;
+    }
+
+    return total + getDistanceMeters(path[index - 1], point);
+  }, 0);
+}
+
+function sampleRoutePoints(path: google.maps.LatLngLiteral[], maxPoints: number) {
+  if (path.length <= maxPoints) {
+    return path;
+  }
+
+  const totalDistance = getRouteDistanceMeters(path);
+  if (!Number.isFinite(totalDistance) || totalDistance <= 0) {
+    return [path[0], path[path.length - 1]];
+  }
+
+  const interval = totalDistance / (maxPoints - 1);
+  const sampledPoints = [path[0]];
+  let nextTargetDistance = interval;
+  let travelledDistance = 0;
+
+  for (let index = 1; index < path.length - 1 && sampledPoints.length < maxPoints - 1; index += 1) {
+    const previousPoint = path[index - 1];
+    const point = path[index];
+    const segmentDistance = getDistanceMeters(previousPoint, point);
+
+    travelledDistance += segmentDistance;
+    if (travelledDistance >= nextTargetDistance) {
+      sampledPoints.push(point);
+      nextTargetDistance += interval;
+    }
+  }
+
+  sampledPoints.push(path[path.length - 1]);
+  return sampledPoints;
+}
+
+function getNearestRouteDistanceMeters(path: google.maps.LatLngLiteral[], point: google.maps.LatLngLiteral) {
+  if (!path.length) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.min(...path.map((routePoint) => getDistanceMeters(routePoint, point)));
+}
+
+async function fetchRouteFuelStops(path: google.maps.LatLngLiteral[]): Promise<FuelStop[]> {
+  if (!path.length) {
+    return [];
+  }
+
+  const { PlacesService, PlacesServiceStatus } = (await google.maps.importLibrary("places")) as google.maps.PlacesLibrary;
+  const service = new PlacesService(document.createElement("div"));
+  const samplePoints = sampleRoutePoints(path, maxRouteFuelSearchPoints);
+
+  const searchAtPoint = (point: google.maps.LatLngLiteral) =>
+    new Promise<FuelStop[]>((resolve, reject) => {
+      service.nearbySearch(
+        {
+          location: new google.maps.LatLng(point.lat, point.lng),
+          radius: routeFuelSearchRadiusMeters,
+          type: "gas_station",
+        },
+        (results, status) => {
+          if (status === PlacesServiceStatus.ZERO_RESULTS) {
+            resolve([]);
+            return;
+          }
+
+          if (status !== PlacesServiceStatus.OK) {
+            reject(new Error("Places Nearby Search failed for fuel stops."));
+            return;
+          }
+
+          resolve(
+            (results ?? [])
+              .map((place) => {
+                const location = place.geometry?.location;
+
+                if (!location || !place.place_id) {
+                  return null;
+                }
+
+                const position = { lat: location.lat(), lng: location.lng() };
+
+                return {
+                  id: place.place_id,
+                  name: place.name ?? "Fuel stop",
+                  type: "Fuel",
+                  lat: position.lat,
+                  lng: position.lng,
+                  distanceMeters: Math.round(getNearestRouteDistanceMeters(path, position)),
+                  ...(typeof place.rating === "number" ? { rating: place.rating } : {}),
+                } satisfies FuelStop;
+              })
+              .filter((stop): stop is FuelStop => stop !== null)
+          );
+        }
+      );
+    });
+
+  const settledResults = await Promise.allSettled(samplePoints.map(searchAtPoint));
+  const rejectedSearch = settledResults.find((result) => result.status === "rejected");
+
+  if (rejectedSearch?.status === "rejected") {
+    throw rejectedSearch.reason instanceof Error
+      ? rejectedSearch.reason
+      : new Error("Unable to fetch fuel stops on this route.");
+  }
+
+  const fuelStopsById = new Map<string, FuelStop>();
+  settledResults.forEach((result) => {
+    if (result.status !== "fulfilled") {
+      return;
+    }
+
+    result.value.forEach((stop) => {
+      const currentStop = fuelStopsById.get(stop.id);
+      if (!currentStop || stop.distanceMeters < currentStop.distanceMeters) {
+        fuelStopsById.set(stop.id, stop);
+      }
+    });
+  });
+
+  return Array.from(fuelStopsById.values())
+    .filter((stop) => stop.distanceMeters <= routeFuelSearchRadiusMeters)
+    .sort((a, b) => a.distanceMeters - b.distanceMeters)
+    .slice(0, 18);
+}
+
+function getCityCandidatesFromGeocoderResults(results: google.maps.GeocoderResult[]) {
+  const preferredTypes = [
+    "locality",
+    "postal_town",
+    "administrative_area_level_3",
+    "administrative_area_level_2",
+    "administrative_area_level_1",
+  ];
+  const candidates: string[] = [];
+
+  for (const type of preferredTypes) {
+    results
+      .flatMap((result) => result.address_components)
+      .filter((component) => component.types.includes(type))
+      .forEach((component) => {
+        if (component.long_name && !candidates.includes(component.long_name)) {
+          candidates.push(component.long_name);
+        }
+      });
+  }
+
+  return candidates;
+}
+
+function getCityFromGeocoderResults(results: google.maps.GeocoderResult[]) {
+  return getCityCandidatesFromGeocoderResults(results)[0] ?? null;
+}
+
+function fetchCityCandidatesForLocation(location: google.maps.LatLngLiteral) {
+  const geocoder = new google.maps.Geocoder();
+
+  return new Promise<string[]>((resolve) => {
+    geocoder.geocode({ location }, (results, status) => {
+      if (status !== "OK" || !results?.length) {
+        resolve([]);
+        return;
+      }
+
+      resolve(getCityCandidatesFromGeocoderResults(results));
+    });
+  });
+}
+
+async function getDieselPriceFromCityCandidates(
+  candidates: string[],
+  getCachedDieselPrice: (city: string) => Promise<DieselPriceLookup>
+) {
+  const expandedCandidates = candidates.flatMap((city) => [
+    city,
+    ...(fuelPriceCityAliases[city.trim().toLowerCase().replace(/[^a-z0-9]+/g, "")] ?? []),
+  ]);
+  const uniqueCandidates = Array.from(new Set(expandedCandidates));
+
+  for (const city of uniqueCandidates) {
+    try {
+      return await getCachedDieselPrice(city);
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function fetchCityForLocation(location: google.maps.LatLngLiteral) {
+  const geocoder = new google.maps.Geocoder();
+
+  return new Promise<string | null>((resolve) => {
+    geocoder.geocode({ location }, (results, status) => {
+      if (status !== "OK" || !results?.length) {
+        resolve(null);
+        return;
+      }
+
+      resolve(getCityFromGeocoderResults(results));
+    });
+  });
+}
+
+async function fetchDieselPrice(city: string): Promise<DieselPriceLookup> {
+  const response = await fetch(`/api/fuel-price?city=${encodeURIComponent(city)}`);
+  const payload = (await response.json()) as Partial<DieselPriceLookup> & { error?: string };
+
+  if (!response.ok || typeof payload.dieselPrice !== "number") {
+    throw new Error(payload.error || "Unable to fetch diesel price.");
+  }
+
+  return {
+    city: payload.city || city,
+    dieselPrice: payload.dieselPrice,
+    cached: payload.cached,
+  };
+}
+
+async function enrichFuelStopsWithCityPrices(
+  stops: FuelStop[],
+  getCachedDieselPrice: (city: string) => Promise<DieselPriceLookup>
+) {
+  return Promise.all(
+    stops.map(async (stop) => {
+      const cityCandidates = await fetchCityCandidatesForLocation({ lat: stop.lat, lng: stop.lng });
+      const price = await getDieselPriceFromCityCandidates(cityCandidates, getCachedDieselPrice);
+
+      if (!price) {
+        return {
+          ...stop,
+          city: cityCandidates[0],
+          priceUnavailable: true,
+        };
+      }
+
+      return {
+        ...stop,
+        city: price.city,
+        dieselPrice: price.dieselPrice,
+        priceUnavailable: false,
+      };
+    })
+  );
+}
+
+function getFuelStopMarkerIcon(): google.maps.Icon {
+  const svg = encodeURIComponent(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="62" height="44" viewBox="0 0 62 44">
+      <path d="M31 43s16-11.8 16-26A16 16 0 1 0 15 17c0 14.2 16 26 16 26Z" fill="#16a34a" stroke="white" stroke-width="3"/>
+      <rect x="3" y="3" width="56" height="18" rx="8" fill="white" stroke="#16a34a" stroke-width="2"/>
+      <text x="31" y="31" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="800" fill="white">D</text>
+    </svg>
+  `);
+
+  return {
+    url: `data:image/svg+xml;charset=UTF-8,${svg}`,
+    scaledSize: new google.maps.Size(62, 44),
+    anchor: new google.maps.Point(31, 43),
+    labelOrigin: new google.maps.Point(31, 13),
+  };
+}
+
+function getRecommendedRouteLabel(
+  routes: Array<{ label: string; durationSeconds: number; risk: number; dieselPrice?: number }>
+) {
+  if (!routes.length) {
+    return null;
+  }
+
+  const fastestDurationSeconds = Math.min(...routes.map((route) => route.durationSeconds));
+  const viableRoutes = routes.filter((route) => route.risk < 85);
+  const candidateRoutes = viableRoutes.length ? viableRoutes : routes;
+  const reasonableEtaLimitSeconds = Math.max(fastestDurationSeconds + 10 * 60, fastestDurationSeconds * 1.15);
+  const reasonableEtaRoutes = candidateRoutes.filter(
+    (route) => route.durationSeconds <= reasonableEtaLimitSeconds
+  );
+  const recommendationPool = reasonableEtaRoutes.length ? reasonableEtaRoutes : candidateRoutes;
+  const fuelPricedRoutes = recommendationPool.filter((route) => typeof route.dieselPrice === "number");
+
+  if (fuelPricedRoutes.length > 1) {
+    return [...fuelPricedRoutes].sort(
+      (a, b) =>
+        (a.dieselPrice ?? Number.POSITIVE_INFINITY) - (b.dieselPrice ?? Number.POSITIVE_INFINITY) ||
+        a.risk - b.risk ||
+        a.durationSeconds - b.durationSeconds
+    )[0].label;
+  }
+
+  return [...recommendationPool].sort(
+    (a, b) => a.risk - b.risk || a.durationSeconds - b.durationSeconds
+  )[0].label;
+}
+
 function getRouteKey(source: string, destination: string) {
   return `${source.trim().toLowerCase()}__${destination.trim().toLowerCase()}`;
 }
@@ -260,6 +1044,90 @@ function formatThreatDecisionLabel(zone: ThreatZone) {
   }
 
   return `lat ${zone.center.lat.toFixed(4)}, lng ${zone.center.lng.toFixed(4)}`;
+}
+
+function getConfidenceLabel(confidence: number) {
+  if (confidence <= 25) {
+    return {
+      label: "Low Confidence",
+      className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    };
+  }
+
+  if (confidence <= 75) {
+    return {
+      label: "Medium Confidence",
+      className: "border-amber-200 bg-amber-50 text-amber-700",
+    };
+  }
+
+  return {
+    label: "High Confidence",
+    className: "border-rose-200 bg-rose-50 text-rose-700",
+  };
+}
+
+function getPrimaryLanguageCode(locale: string) {
+  return locale.trim().toLowerCase().split("-")[0] || "en";
+}
+
+function getVoiceLanguageLabel(locale: string) {
+  const languageCode = getPrimaryLanguageCode(locale);
+
+  switch (languageCode) {
+    case "ta":
+      return "Tamil";
+    case "hi":
+      return "Hindi";
+    case "te":
+      return "Telugu";
+    case "ml":
+      return "Malayalam";
+    case "kn":
+      return "Kannada";
+    case "mr":
+      return "Marathi";
+    case "bn":
+      return "Bengali";
+    case "gu":
+      return "Gujarati";
+    case "pa":
+      return "Punjabi";
+    case "ur":
+      return "Urdu";
+    case "es":
+      return "Spanish";
+    case "fr":
+      return "French";
+    case "de":
+      return "German";
+    case "it":
+      return "Italian";
+    case "pt":
+      return "Portuguese";
+    case "ja":
+      return "Japanese";
+    case "ko":
+      return "Korean";
+    case "zh":
+      return "Chinese";
+    case "ar":
+      return "Arabic";
+    default:
+      return "English";
+  }
+}
+
+function findMatchingVoice(voices: SpeechSynthesisVoice[], locale: string) {
+  const normalizedLocale = locale.trim().toLowerCase();
+  const primaryLanguageCode = getPrimaryLanguageCode(locale);
+
+  return (
+    voices.find((voice) => voice.lang.toLowerCase() === normalizedLocale) ||
+    voices.find((voice) => voice.lang.toLowerCase().startsWith(normalizedLocale)) ||
+    voices.find((voice) => getPrimaryLanguageCode(voice.lang) === primaryLanguageCode) ||
+    null
+  );
 }
 
 function findClosestCoordinateIndex(
@@ -320,6 +1188,7 @@ async function computeRoutes({
     polylineQuality: "HIGH_QUALITY",
     fields: routeFields,
   });
+  console.info(`Google Routes API returned ${response.routes?.length ?? 0} route(s).`);
 
   return (response.routes ?? []).map((route) => {
     const path = ((route.path as Array<google.maps.LatLngLiteral | google.maps.LatLng>) ?? []).map(toLatLngLiteral);
@@ -339,8 +1208,11 @@ function toThreatZone(record: ThreatZoneRecord): ThreatZone {
   return {
     id: record.id,
     center: { lat: record.lat, lng: record.lng },
-    radius: record.radius,
+    radius: record.radius ?? defaultRiskZoneRadiusMeters,
     severity: record.severity,
+    confidence: record.confidence ?? defaultThreatConfidence,
+    reports: record.reports,
+    verifiedBy: record.verifiedBy,
     sourceVehicleId: record.sourceVehicleId,
     routeKey: record.routeKey,
   };
@@ -383,16 +1255,19 @@ function SafeRoutePlanner() {
   const mapRef = useRef<google.maps.Map | null>(null);
   const sourceAutocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
   const destinationAutocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
+  const riskLocationAutocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
   const threatZoneCreatedRef = useRef(false);
   const reroutedThreatZonesRef = useRef<Set<string>>(new Set());
   const rerouteInFlightRef = useRef(false);
   const restoringNavigationRef = useRef(false);
   const vehicleIndexRef = useRef(0);
   const latestVehiclePositionRef = useRef<google.maps.LatLngLiteral | null>(null);
+  const lastSafeStopsRequestKeyRef = useRef("");
   const [navigationId, setNavigationId] = useState("");
   const [source, setSource] = useState("");
   const [destination, setDestination] = useState("");
   const [routeCoordinates, setRouteCoordinates] = useState<google.maps.LatLngLiteral[]>([]);
+  const [generatedRoutes, setGeneratedRoutes] = useState<GeneratedRouteOption[]>([]);
   const [routeId, setRouteId] = useState("");
   const [routeSummary, setRouteSummary] = useState<RouteSummary | null>(null);
   const [status, setStatus] = useState<RouteStatus>("idle");
@@ -403,14 +1278,33 @@ function SafeRoutePlanner() {
   const [syncStatus, setSyncStatus] = useState("Connecting");
   const [syncError, setSyncError] = useState("");
   const [riskScore, setRiskScore] = useState(0);
+  const [riskReportOpen, setRiskReportOpen] = useState(false);
+  const [riskReportType, setRiskReportType] = useState<RiskReportType>("suspicious");
+  const [riskIssueDetails, setRiskIssueDetails] = useState("");
+  const [riskLocationSource, setRiskLocationSource] = useState<RiskLocationSource>("vehicle");
+  const [riskLocationQuery, setRiskLocationQuery] = useState("");
+  const [selectedRiskLocation, setSelectedRiskLocation] = useState<google.maps.LatLngLiteral | null>(null);
+  const [riskReportMessage, setRiskReportMessage] = useState("");
   const [threatZone, setThreatZone] = useState<ThreatZone | null>(null);
   const [threatZones, setThreatZones] = useState<ThreatZone[]>([]);
   const [incidentMessages, setIncidentMessages] = useState<IncidentMessageRecord[]>([]);
   const [threatZoneStatus, setThreatZoneStatus] = useState("");
   const [threatZoneError, setThreatZoneError] = useState("");
+  const [verifyingThreatId, setVerifyingThreatId] = useState("");
+  const [threatVerificationMessage, setThreatVerificationMessage] = useState("");
   const [incidentError, setIncidentError] = useState("");
   const [rerouteStatus, setRerouteStatus] = useState("");
   const [driverBriefing, setDriverBriefing] = useState("No active advisories.");
+  const [safeStops, setSafeStops] = useState<SafeStop[]>([]);
+  const [safeStopsLoading, setSafeStopsLoading] = useState(false);
+  const [safeStopsError, setSafeStopsError] = useState("");
+  const [safeStopsOpen, setSafeStopsOpen] = useState(true);
+  const [fuelStops, setFuelStops] = useState<FuelStop[]>([]);
+  const [fuelStopsLoading, setFuelStopsLoading] = useState(false);
+  const [fuelStopsError, setFuelStopsError] = useState("");
+  const [fuelStopsOpen, setFuelStopsOpen] = useState(true);
+  const [currentDieselPrice, setCurrentDieselPrice] = useState<DieselPriceLookup | null>(null);
+  const [routeFuelPrices, setRouteFuelPrices] = useState<Record<string, RouteFuelPriceSummary>>({});
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceLanguage, setVoiceLanguage] = useState("en-US");
   const [availableVoiceLanguages, setAvailableVoiceLanguages] = useState<string[]>(["en-US"]);
@@ -418,11 +1312,47 @@ function SafeRoutePlanner() {
   const [advisoryOpen, setAdvisoryOpen] = useState(true);
   const [riskOpen, setRiskOpen] = useState(false);
   const [aiDecisionOpen, setAiDecisionOpen] = useState(false);
+  const [convoyModeActive, setConvoyModeActive] = useState(false);
+  const [convoyOpen, setConvoyOpen] = useState(true);
+  const [convoyEmergencyActive, setConvoyEmergencyActive] = useState(false);
+  const [fleetPartners, setFleetPartners] = useState<TrackedVehicle[]>([]);
   const [aiDecisionLogs, setAiDecisionLogs] = useState<string[]>([
     "Route intelligence standing by. Plan a route to begin monitoring.",
   ]);
   const spokenIncidentIdsRef = useRef<Set<string>>(new Set());
   const spokenThreatZoneIdsRef = useRef<Set<string>>(new Set());
+  const spokenFuelStopIdsRef = useRef<Set<string>>(new Set());
+  const dieselPriceCacheRef = useRef<Map<string, DieselPriceLookup>>(new Map());
+  const lastFuelStopsRouteKeyRef = useRef("");
+  const lastMovingFuelStopsRequestKeyRef = useRef("");
+  const lastDieselGeoKeyRef = useRef("");
+  const lastDieselCityRef = useRef("");
+  const voiceLanguageRef = useRef("en-US");
+  const convoyEmergencyActiveRef = useRef(false);
+  const soundedConvoySosIdsRef = useRef<Set<string>>(new Set());
+
+  const convoyModeActiveRef = useRef(convoyModeActive);
+
+  useEffect(() => {
+    convoyModeActiveRef.current = convoyModeActive;
+  }, [convoyModeActive]);
+
+  useEffect(() => {
+    convoyEmergencyActiveRef.current = convoyEmergencyActive;
+  }, [convoyEmergencyActive]);
+
+  useEffect(() => {
+    if (!convoyModeActive && navigationId) {
+      convoyEmergencyActiveRef.current = false;
+      setConvoyEmergencyActive(false);
+      void updateVehicleLiveLocation({
+        vehicleId: navigationId,
+        location: latestVehiclePositionRef.current || routeCoordinates[0] || defaultCenter,
+        convoyId: null,
+        status: "normal",
+      }).catch(() => undefined);
+    }
+  }, [convoyModeActive, navigationId, routeCoordinates]);
 
   const routeMeta = useMemo(() => {
     return {
@@ -431,6 +1361,29 @@ function SafeRoutePlanner() {
       coordinateCount: routeCoordinates.length,
     };
   }, [routeCoordinates.length, routeSummary]);
+  const routeRiskSummaries = useMemo(
+    () =>
+      generatedRoutes.map((route) => {
+        const risk = calculateRouteRiskScore(route.path, threatZones);
+
+        return {
+          label: route.label,
+          eta: route.durationText,
+          distance: route.distanceText,
+          durationSeconds: route.durationSeconds,
+          risk,
+          riskCategory: getRouteRiskCategory(risk),
+          dieselPrice: routeFuelPrices[route.label]?.dieselPrice,
+          dieselCity: routeFuelPrices[route.label]?.city,
+        };
+      }),
+    [generatedRoutes, routeFuelPrices, threatZones]
+  );
+  const recommendedRouteLabel = useMemo(
+    () => getRecommendedRouteLabel(routeRiskSummaries),
+    [routeRiskSummaries]
+  );
+  const selectedRouteLabel = routeRiskSummaries[0]?.label ?? null;
 
   const routeKey = useMemo(() => getRouteKey(source, destination), [destination, source]);
   const displayedVehiclePosition = vehiclePosition;
@@ -452,6 +1405,10 @@ function SafeRoutePlanner() {
         (zone) => getDistanceMeters(displayedVehiclePosition, zone.center) <= zone.radius
       )
     : null;
+  const activeThreatConfidence = activeThreatZone ? getConfidenceLabel(activeThreatZone.confidence) : null;
+  const activeRiskZoneStyle = activeThreatZone
+    ? getRiskZoneStyle(getRiskZoneLevelFromConfidence(activeThreatZone.confidence))
+    : null;
   const upcomingThreatZone = displayedVehiclePosition
     ? relevantThreatZones
         .map((zone) => ({
@@ -465,15 +1422,35 @@ function SafeRoutePlanner() {
         .filter(({ zone, distance, routeConflict }) => routeConflict || distance <= zone.radius + threatApproachBufferMeters)
         .sort((a, b) => a.distance - b.distance)[0]?.zone ?? null
     : null;
-  const riskColor =
-    riskScore >= 70
-      ? "bg-rose-100 text-rose-700"
-      : riskScore >= 40
-        ? "bg-amber-100 text-amber-700"
-        : "bg-emerald-100 text-emerald-700";
-  const riskTrackColor =
-    riskScore >= 70 ? "bg-red-400" : riskScore >= 40 ? "bg-yellow-300" : "bg-emerald-300";
+  const safeStopTriggerZone = useMemo(() => {
+    if (!routeCoordinates.length) {
+      return null;
+    }
 
+    const routeZoneMatches = relevantThreatZones
+      .map((zone) => ({
+        zone,
+        level: getRiskZoneLevelFromConfidence(zone.confidence),
+        clearanceMeters: getRouteZoneClearanceMeters(routeCoordinates, zone),
+      }))
+      .filter(
+        ({ level, clearanceMeters }) =>
+          (level === "medium" || level === "high") && clearanceMeters <= routeRiskScanMeters
+      )
+      .sort((a, b) => a.clearanceMeters - b.clearanceMeters);
+
+    return routeZoneMatches[0]?.zone ?? null;
+  }, [relevantThreatZones, routeCoordinates]);
+  const safeStopsRerouteActive =
+    rerouteStatus.startsWith("Evaluating") || rerouteStatus.startsWith("Optimized");
+  const safeStopsTriggerId = safeStopTriggerZone?.id ?? (safeStopsRerouteActive ? "reroute" : "");
+  const shouldShowSafeStops =
+    Boolean(safeStopsTriggerId || safeStops.length || safeStopsLoading || safeStopsError) &&
+    Boolean(displayedVehiclePosition || safeStops.length || safeStopsError);
+  const currentThreatConfidence = threatZone ? getConfidenceLabel(threatZone.confidence) : null;
+  const currentRiskZoneStyle = threatZone
+    ? getRiskZoneStyle(getRiskZoneLevelFromConfidence(threatZone.confidence))
+    : null;
   const vehicleSpeed = useMemo(() => {
     const distanceMeters = routeSummary?.distanceMeters;
     const durationSeconds = routeSummary?.durationSeconds;
@@ -514,6 +1491,40 @@ function SafeRoutePlanner() {
     };
   }, [isLoaded]);
 
+  const getPartnerTruckIcon = useCallback((status: string) => {
+    if (!isLoaded) {
+      return undefined;
+    }
+
+    const isDistress = status !== "normal";
+    const bodyColor = isDistress ? "#f87171" : "#fbbf24";
+    const cabColor = isDistress ? "#dc2626" : "#d97706";
+    const windowColor = isDistress ? "#fee2e2" : "#fffbeb";
+
+    const svg = encodeURIComponent(`
+      <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+        <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+          <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000000" flood-opacity="0.45"/>
+        </filter>
+        <g filter="url(#shadow)">
+          <rect x="8" y="18" width="22" height="14" rx="3" fill="${bodyColor}"/>
+          <path d="M30 22h7l5 6v4H30V22Z" fill="${cabColor}"/>
+          <path d="M34 24h3.2l2.4 3H34v-3Z" fill="${windowColor}"/>
+          <circle cx="15" cy="34" r="4" fill="#081318"/>
+          <circle cx="36" cy="34" r="4" fill="#081318"/>
+          <circle cx="15" cy="34" r="1.7" fill="#e6fbff"/>
+          <circle cx="36" cy="34" r="1.7" fill="#e6fbff"/>
+        </g>
+      </svg>
+    `);
+
+    return {
+      url: `data:image/svg+xml;charset=UTF-8,${svg}`,
+      scaledSize: new google.maps.Size(42, 42),
+      anchor: new google.maps.Point(21, 34),
+    };
+  }, [isLoaded]);
+
   const addAiDecisionLog = useCallback((entry: string) => {
     const timestamp = new Date().toLocaleTimeString([], {
       hour: "2-digit",
@@ -531,15 +1542,14 @@ function SafeRoutePlanner() {
       }
 
       const utterance = new SpeechSynthesisUtterance(text);
-      const matchingVoice = window.speechSynthesis
-        ?.getVoices()
-        .find((voice) => voice.lang.toLowerCase().startsWith(voiceLanguage.toLowerCase()));
+      const availableVoices = window.speechSynthesis?.getVoices() ?? [];
+      const matchingVoice = findMatchingVoice(availableVoices, voiceLanguage);
 
       if (matchingVoice) {
         utterance.voice = matchingVoice;
         utterance.lang = matchingVoice.lang;
       } else {
-        utterance.lang = voiceLanguage;
+        utterance.lang = getPrimaryLanguageCode(voiceLanguage);
       }
 
       window.speechSynthesis?.cancel();
@@ -549,10 +1559,109 @@ function SafeRoutePlanner() {
     [voiceEnabled, voiceLanguage]
   );
 
+  const playEmergencyBuzzer = useCallback(() => {
+    const AudioContextClass =
+      window.AudioContext ||
+      (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) {
+      return;
+    }
+
+    const audioContext = new AudioContextClass();
+    const gainNode = audioContext.createGain();
+    gainNode.gain.setValueAtTime(0.0001, audioContext.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.35, audioContext.currentTime + 0.03);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + 5);
+    gainNode.connect(audioContext.destination);
+
+    [0, 0.42, 0.84, 1.26, 1.68, 2.1, 2.52, 2.94, 3.36, 3.78, 4.2, 4.62].forEach((offset) => {
+      const oscillator = audioContext.createOscillator();
+      oscillator.type = "square";
+      oscillator.frequency.setValueAtTime(880, audioContext.currentTime + offset);
+      oscillator.connect(gainNode);
+      oscillator.start(audioContext.currentTime + offset);
+      oscillator.stop(audioContext.currentTime + offset + 0.22);
+    });
+
+    window.setTimeout(() => {
+      void audioContext.close();
+    }, 5400);
+  }, []);
+
+  const speakVoiceGuidance = useCallback(
+    async (text: string, speechKey: string) => {
+      if (!voiceEnabled || spokenThreatZoneIdsRef.current.has(speechKey)) {
+        return;
+      }
+
+      try {
+        const response = await fetch("/api/voice-guidance", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text,
+            targetLanguage: voiceLanguage,
+          }),
+        });
+        const payload = (await response.json()) as {
+          audioContent?: string;
+          mimeType?: string;
+          translatedText?: string;
+        };
+
+        if (!response.ok || !payload.audioContent) {
+          speakText(payload.translatedText || text, speechKey);
+          return;
+        }
+
+        window.speechSynthesis?.cancel();
+        const audio = new Audio(`data:${payload.mimeType ?? "audio/mpeg"};base64,${payload.audioContent}`);
+        await audio.play();
+        spokenThreatZoneIdsRef.current.add(speechKey);
+      } catch {
+        speakText(text, speechKey);
+      }
+    },
+    [speakText, voiceEnabled, voiceLanguage]
+  );
+
+  const getCachedDieselPrice = useCallback(async (city: string) => {
+    const normalizedCity = city.trim().toLowerCase();
+    const cached = dieselPriceCacheRef.current.get(normalizedCity);
+
+    if (cached) {
+      return cached;
+    }
+
+    const price = await fetchDieselPrice(city);
+    dieselPriceCacheRef.current.set(normalizedCity, price);
+    return price;
+  }, []);
+
   const saveNavigationSnapshot = useCallback((snapshot: NavigationSnapshot) => {
     window.sessionStorage.setItem(navigationSessionStorageKey, snapshot.navigationId);
     window.sessionStorage.setItem(navigationStateStorageKey, JSON.stringify(snapshot));
   }, []);
+
+  const handleConvoySosToggle = useCallback(async () => {
+    if (!navigationId || !displayedVehiclePosition || !routeKey) {
+      return;
+    }
+
+    const nextEmergencyActive = !convoyEmergencyActiveRef.current;
+    const currentConvoyId = convoyModeActiveRef.current ? `convoy_${routeKey}` : null;
+    convoyEmergencyActiveRef.current = nextEmergencyActive;
+    setConvoyEmergencyActive(nextEmergencyActive);
+
+    await updateVehicleLiveLocation({
+      vehicleId: navigationId,
+      location: displayedVehiclePosition,
+      convoyId: currentConvoyId,
+      status: nextEmergencyActive ? "sos" : "normal",
+    });
+  }, [displayedVehiclePosition, navigationId, routeKey]);
 
   useEffect(() => {
     if (!relevantIncident) {
@@ -591,24 +1700,6 @@ function SafeRoutePlanner() {
         setDriverBriefing(nextBriefing);
         addAiDecisionLog(`Driver advisory updated: ${nextBriefing}`);
 
-        if (!voiceEnabled || spokenIncidentIdsRef.current.has(incident.id)) {
-          return;
-        }
-
-        const utterance = new SpeechSynthesisUtterance(nextBriefing);
-        const matchingVoice = window.speechSynthesis
-          ?.getVoices()
-          .find((voice) => voice.lang.toLowerCase().startsWith(voiceLanguage.toLowerCase()));
-
-        if (matchingVoice) {
-          utterance.voice = matchingVoice;
-          utterance.lang = matchingVoice.lang;
-        } else {
-          utterance.lang = voiceLanguage;
-        }
-
-        window.speechSynthesis?.cancel();
-        window.speechSynthesis?.speak(utterance);
         spokenIncidentIdsRef.current.add(incident.id);
       } catch {
         if (!isCancelled) {
@@ -631,6 +1722,46 @@ function SafeRoutePlanner() {
   }, [voiceEnabled]);
 
   useEffect(() => {
+    voiceLanguageRef.current = voiceLanguage;
+  }, [voiceLanguage]);
+
+  useEffect(() => {
+    try {
+      const rawVoiceSettings = window.localStorage.getItem(voiceSettingsStorageKey);
+
+      if (!rawVoiceSettings) {
+        return;
+      }
+
+      const parsedVoiceSettings = JSON.parse(rawVoiceSettings) as {
+        enabled?: boolean;
+        language?: string;
+      };
+
+      if (typeof parsedVoiceSettings.enabled === "boolean") {
+        setVoiceEnabled(parsedVoiceSettings.enabled);
+      }
+
+      if (typeof parsedVoiceSettings.language === "string" && parsedVoiceSettings.language.trim()) {
+        voiceLanguageRef.current = parsedVoiceSettings.language;
+        setVoiceLanguage(parsedVoiceSettings.language);
+      }
+    } catch {
+      window.localStorage.removeItem(voiceSettingsStorageKey);
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      voiceSettingsStorageKey,
+      JSON.stringify({
+        enabled: voiceEnabled,
+        language: voiceLanguage,
+      })
+    );
+  }, [voiceEnabled, voiceLanguage]);
+
+  useEffect(() => {
     const storedNavigationId = window.sessionStorage.getItem(navigationSessionStorageKey);
     const storedNavigationState = window.sessionStorage.getItem(navigationStateStorageKey);
 
@@ -648,6 +1779,19 @@ function SafeRoutePlanner() {
       setRouteId(snapshot.routeId);
       setRouteCoordinates(snapshot.routeCoordinates);
       setRouteSummary(snapshot.routeSummary);
+      setGeneratedRoutes(
+        snapshot.routeCoordinates.length
+          ? [
+              {
+                label: "Route A",
+                path: snapshot.routeCoordinates,
+                distanceText: snapshot.routeSummary?.distanceText ?? "No route",
+                durationSeconds: snapshot.routeSummary?.durationSeconds ?? 0,
+                durationText: snapshot.routeSummary?.durationText ?? "Awaiting route",
+              },
+            ]
+          : []
+      );
       setVehiclePosition(snapshot.vehiclePosition);
       latestVehiclePositionRef.current = snapshot.vehiclePosition;
       vehicleIndexRef.current = snapshot.vehicleIndex;
@@ -673,9 +1817,10 @@ function SafeRoutePlanner() {
             return null;
           }
 
-          return nextZones.some((zone) => zone.id === currentZone.id) ? currentZone : null;
+          return nextZones.find((zone) => zone.id === currentZone.id) ?? null;
         });
         setThreatZoneError("");
+        setThreatVerificationMessage("");
       },
       (error) => {
         setThreatZoneError(error.message);
@@ -688,15 +1833,31 @@ function SafeRoutePlanner() {
   useEffect(() => {
     const loadVoices = () => {
       const voices = window.speechSynthesis?.getVoices() ?? [];
-      const nextLanguages = Array.from(
-        new Set(voices.map((voice) => voice.lang).filter((lang) => Boolean(lang)))
-      );
+      const uniqueLanguagesByCode = new Map<string, string>();
+
+      voices.forEach((voice) => {
+        if (!voice.lang) {
+          return;
+        }
+
+        const languageCode = getPrimaryLanguageCode(voice.lang);
+
+        if (!uniqueLanguagesByCode.has(languageCode)) {
+          uniqueLanguagesByCode.set(languageCode, voice.lang);
+        }
+      });
+
+      const nextLanguages = Array.from(uniqueLanguagesByCode.values());
 
       if (nextLanguages.length) {
-        setAvailableVoiceLanguages(nextLanguages);
-        setVoiceLanguage((currentLanguage) =>
-          nextLanguages.includes(currentLanguage) ? currentLanguage : nextLanguages[0]
+        const savedLanguage = voiceLanguageRef.current;
+        const includesSavedLanguage = nextLanguages.some(
+          (language) =>
+            language.toLowerCase() === savedLanguage.toLowerCase() ||
+            getPrimaryLanguageCode(language) === getPrimaryLanguageCode(savedLanguage)
         );
+
+        setAvailableVoiceLanguages(includesSavedLanguage ? nextLanguages : [...nextLanguages, savedLanguage]);
       }
     };
 
@@ -723,20 +1884,64 @@ function SafeRoutePlanner() {
   }, []);
 
   useEffect(() => {
+    if (!convoyModeActive || !navigationId || !routeKey) {
+      setFleetPartners([]);
+      return;
+    }
+
+    const currentConvoyId = `convoy_${routeKey}`;
+    const unsubscribe = subscribeToConvoyVehicles(
+      currentConvoyId,
+      (vehicles) => {
+        const partners = vehicles.filter((v) => v.vehicleId !== navigationId);
+        setFleetPartners(partners);
+      },
+      (error) => {
+        console.error("Convoy subscription error:", error);
+      }
+    );
+
+    return unsubscribe;
+  }, [convoyModeActive, navigationId, routeKey]);
+
+  useEffect(() => {
+    fleetPartners
+      .filter((partner) => partner.status === "sos")
+      .forEach((partner) => {
+        if (soundedConvoySosIdsRef.current.has(partner.vehicleId)) {
+          return;
+        }
+
+        soundedConvoySosIdsRef.current.add(partner.vehicleId);
+        playEmergencyBuzzer();
+      });
+
+    fleetPartners
+      .filter((partner) => partner.status !== "sos")
+      .forEach((partner) => soundedConvoySosIdsRef.current.delete(partner.vehicleId));
+  }, [fleetPartners, playEmergencyBuzzer]);
+
+  useEffect(() => {
     if (riskScore <= 60 || threatZoneCreatedRef.current) {
       return;
     }
 
-    const zoneCenter = displayedVehiclePosition ?? routeCoordinates[0] ?? defaultCenter;
-    const severity = riskScore >= 80 ? "critical" : "high";
+    const zoneCenter = selectedRiskLocation ?? displayedVehiclePosition ?? routeCoordinates[0] ?? defaultCenter;
+    const reportCount = initialThreatReports;
+    const confidence = initialThreatConfidence;
+    const riskZoneLevel = getRiskZoneLevelFromReports(reportCount);
+    const severity = riskZoneLevel;
+    const zoneRadius = getRiskZoneRadiusMeters(riskZoneLevel);
     threatZoneCreatedRef.current = true;
-    setThreatZoneStatus("Creating threat zone");
+    setThreatZoneStatus("Creating risk zone");
 
     createThreatZone({
       lat: zoneCenter.lat,
       lng: zoneCenter.lng,
-      radius: 2000,
+      radius: zoneRadius,
       severity,
+      confidence,
+      reports: reportCount,
       sourceVehicleId: navigationId || undefined,
       routeKey: routeKey || undefined,
     })
@@ -744,8 +1949,11 @@ function SafeRoutePlanner() {
         const nextThreatZone = {
           id,
           center: zoneCenter,
-          radius: 2000,
+          radius: zoneRadius,
           severity,
+          confidence,
+          reports: reportCount,
+          verifiedBy: navigationId ? [navigationId] : [],
           sourceVehicleId: navigationId || undefined,
           routeKey: routeKey || undefined,
         };
@@ -754,17 +1962,316 @@ function SafeRoutePlanner() {
         setThreatZones((currentZones) =>
           currentZones.some((zone) => zone.id === id) ? currentZones : [...currentZones, nextThreatZone]
         );
-        setThreatZoneStatus("Threat zone active");
+        setThreatZoneStatus("Risk zone active");
       })
       .catch((error) => {
         threatZoneCreatedRef.current = false;
-        setThreatZoneStatus(error instanceof Error ? error.message : "Unable to create threat zone");
+        setThreatZoneStatus(error instanceof Error ? error.message : "Unable to create risk zone");
       });
-  }, [displayedVehiclePosition, navigationId, riskScore, routeCoordinates, routeKey]);
+  }, [displayedVehiclePosition, navigationId, riskScore, routeCoordinates, routeKey, selectedRiskLocation]);
 
   useEffect(() => {
     latestVehiclePositionRef.current = vehiclePosition;
   }, [vehiclePosition]);
+
+  useEffect(() => {
+    if (!isLoaded || !safeStopsTriggerId || !displayedVehiclePosition) {
+      return;
+    }
+
+    const roundedLat = Math.round(displayedVehiclePosition.lat * 100) / 100;
+    const roundedLng = Math.round(displayedVehiclePosition.lng * 100) / 100;
+    const reroutePhase = safeStopsRerouteActive
+      ? rerouteStatus.split(":")[0]
+      : "route-risk";
+    const requestKey = `${safeStopsTriggerId}:${roundedLat}:${roundedLng}:${reroutePhase}`;
+
+    if (lastSafeStopsRequestKeyRef.current === requestKey) {
+      return;
+    }
+
+    let isCancelled = false;
+    lastSafeStopsRequestKeyRef.current = requestKey;
+    setSafeStopsOpen(true);
+    setSafeStopsLoading(true);
+    setSafeStopsError("");
+
+    fetchSafeStops(displayedVehiclePosition)
+      .then((stops) => {
+        if (isCancelled) {
+          return;
+        }
+
+        setSafeStops(stops);
+      })
+      .catch((error) => {
+        if (isCancelled) {
+          return;
+        }
+
+        setSafeStops([]);
+        setSafeStopsError(error instanceof Error ? error.message : "Unable to fetch safe stops nearby.");
+      })
+      .finally(() => {
+        if (!isCancelled) {
+          setSafeStopsLoading(false);
+        }
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [displayedVehiclePosition, isLoaded, rerouteStatus, safeStopsRerouteActive, safeStopsTriggerId]);
+
+  useEffect(() => {
+    if (!isLoaded || !navigationId || routeCoordinates.length < 2) {
+      return;
+    }
+
+    const start = routeCoordinates[0];
+    const end = routeCoordinates[routeCoordinates.length - 1];
+    const requestKey = `${navigationId}:${routeCoordinates.length}:${start.lat.toFixed(3)},${start.lng.toFixed(
+      3
+    )}:${end.lat.toFixed(3)},${end.lng.toFixed(3)}`;
+
+    if (lastFuelStopsRouteKeyRef.current === requestKey) {
+      return;
+    }
+
+    let isCancelled = false;
+    lastFuelStopsRouteKeyRef.current = requestKey;
+    setFuelStopsOpen(true);
+    setFuelStopsLoading(true);
+    setFuelStopsError("");
+
+    async function loadRouteFuelStops() {
+      const stops = await fetchRouteFuelStops(routeCoordinates);
+      return enrichFuelStopsWithCityPrices(stops, getCachedDieselPrice);
+    }
+
+    loadRouteFuelStops()
+      .then((stops) => {
+        if (!isCancelled) {
+          setFuelStops(stops);
+        }
+      })
+      .catch((error) => {
+        if (!isCancelled) {
+          setFuelStops([]);
+          setFuelStopsError(error instanceof Error ? error.message : "Unable to fetch fuel stops on this route.");
+        }
+      })
+      .finally(() => {
+        if (!isCancelled) {
+          setFuelStopsLoading(false);
+        }
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [getCachedDieselPrice, isLoaded, navigationId, routeCoordinates]);
+
+  useEffect(() => {
+    if (!isLoaded || !displayedVehiclePosition) {
+      return;
+    }
+
+    const currentPosition = displayedVehiclePosition;
+    const geoKey = `${Math.round(currentPosition.lat * 10) / 10}:${Math.round(currentPosition.lng * 10) / 10}`;
+    if (lastDieselGeoKeyRef.current === geoKey) {
+      return;
+    }
+
+    let isCancelled = false;
+    lastDieselGeoKeyRef.current = geoKey;
+
+    async function loadCurrentCityDieselPrice() {
+      const city = await fetchCityForLocation(currentPosition);
+
+      if (isCancelled || !city) {
+        return;
+      }
+
+      const normalizedCity = city.trim().toLowerCase();
+      if (lastDieselCityRef.current === normalizedCity) {
+        return;
+      }
+
+      lastDieselCityRef.current = normalizedCity;
+
+      try {
+        const price = await getCachedDieselPrice(city);
+        if (!isCancelled) {
+          setCurrentDieselPrice(price);
+        }
+      } catch {
+        if (!isCancelled) {
+          setCurrentDieselPrice(null);
+        }
+      }
+    }
+
+    void loadCurrentCityDieselPrice();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [displayedVehiclePosition, getCachedDieselPrice, isLoaded]);
+
+  useEffect(() => {
+    if (!isLoaded || !navigationId || !displayedVehiclePosition) {
+      return;
+    }
+
+    const currentPosition = displayedVehiclePosition;
+    const movingKey = `${navigationId}:${Math.round(currentPosition.lat * 20) / 20}:${
+      Math.round(currentPosition.lng * 20) / 20
+    }`;
+
+    if (lastMovingFuelStopsRequestKeyRef.current === movingKey) {
+      return;
+    }
+
+    let isCancelled = false;
+    lastMovingFuelStopsRequestKeyRef.current = movingKey;
+
+    async function loadMovingFuelStops() {
+      const stops = await fetchRouteFuelStops([currentPosition]);
+      const enrichedStops = await enrichFuelStopsWithCityPrices(stops, getCachedDieselPrice);
+
+      if (isCancelled || !enrichedStops.length) {
+        return;
+      }
+
+      setFuelStops((currentStops) => {
+        const stopsById = new Map<string, FuelStop>();
+
+        currentStops.forEach((stop) => stopsById.set(stop.id, stop));
+        enrichedStops.forEach((stop) => {
+          const currentStop = stopsById.get(stop.id);
+          if (!currentStop || stop.distanceMeters < currentStop.distanceMeters || !currentStop.dieselPrice) {
+            stopsById.set(stop.id, stop);
+          }
+        });
+
+        return Array.from(stopsById.values())
+          .sort((a, b) => a.distanceMeters - b.distanceMeters)
+          .slice(0, 24);
+      });
+    }
+
+    void loadMovingFuelStops();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [displayedVehiclePosition, getCachedDieselPrice, isLoaded, navigationId]);
+
+  useEffect(() => {
+    if (!isLoaded || !generatedRoutes.length) {
+      setRouteFuelPrices({});
+      return;
+    }
+
+    let isCancelled = false;
+
+    async function loadRouteFuelPrices() {
+      const entries = await Promise.all(
+        generatedRoutes.map(async (route) => {
+          const midpoint = route.path[Math.floor(route.path.length / 2)];
+
+          if (!midpoint) {
+            return null;
+          }
+
+          const city = await fetchCityForLocation(midpoint);
+
+          if (!city) {
+            return null;
+          }
+
+          try {
+            const price = await getCachedDieselPrice(city);
+            return [route.label, { city: price.city, dieselPrice: price.dieselPrice }] as const;
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      if (isCancelled) {
+        return;
+      }
+
+      setRouteFuelPrices(
+        Object.fromEntries(entries.filter((entry): entry is [string, RouteFuelPriceSummary] => entry !== null))
+      );
+    }
+
+    void loadRouteFuelPrices();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [generatedRoutes, getCachedDieselPrice, isLoaded]);
+
+  useEffect(() => {
+    if (!voiceEnabled || !displayedVehiclePosition || !fuelStops.length) {
+      return;
+    }
+
+    const nearbyFuelStops = fuelStops
+      .map((stop) => ({
+        stop,
+        distanceMeters: getDistanceMeters(displayedVehiclePosition, { lat: stop.lat, lng: stop.lng }),
+      }))
+      .filter(({ distanceMeters }) => distanceMeters <= fuelComparisonWindowMeters)
+      .sort((a, b) => a.distanceMeters - b.distanceMeters);
+    const nextFuelStop = nearbyFuelStops.find(
+      ({ stop, distanceMeters }) =>
+        distanceMeters <= fuelAnnouncementDistanceMeters && !spokenFuelStopIdsRef.current.has(stop.id)
+    );
+
+    if (!nextFuelStop) {
+      return;
+    }
+
+    const cheaperNearbyStop = nearbyFuelStops.find(
+      ({ stop, distanceMeters }) =>
+        stop.id !== nextFuelStop.stop.id &&
+        distanceMeters > nextFuelStop.distanceMeters &&
+        typeof stop.dieselPrice === "number" &&
+        typeof nextFuelStop.stop.dieselPrice === "number" &&
+        nextFuelStop.stop.dieselPrice - stop.dieselPrice >= meaningfulDieselPriceDifference
+    );
+    const priceText =
+      typeof nextFuelStop.stop.dieselPrice === "number"
+        ? ` Diesel is Rs ${nextFuelStop.stop.dieselPrice.toFixed(2)} per litre.`
+        : "";
+    const comparisonText = cheaperNearbyStop
+      ? ` Another fuel station ahead has diesel Rs ${cheaperNearbyStop.stop.dieselPrice?.toFixed(2)} per litre.`
+      : "";
+    const englishMessage = `Fuel station ahead in ${Math.max(
+      1,
+      Math.round(nextFuelStop.distanceMeters / 1000)
+    )} kilometers.${priceText}${comparisonText}`;
+    const fuelSpeechKey = `fuel:${nextFuelStop.stop.id}`;
+    let isCancelled = false;
+    spokenFuelStopIdsRef.current.add(nextFuelStop.stop.id);
+
+    async function speakFuelAdvisory() {
+      if (!isCancelled) {
+        await speakVoiceGuidance(englishMessage, fuelSpeechKey);
+      }
+    }
+
+    void speakFuelAdvisory();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [displayedVehiclePosition, fuelStops, speakVoiceGuidance, voiceEnabled]);
 
   useEffect(() => {
     if (!navigationId) {
@@ -779,10 +2286,14 @@ function SafeRoutePlanner() {
       }
 
       try {
+        const currentConvoyId = convoyModeActiveRef.current ? `convoy_${routeKey}` : null;
         await updateVehicleLiveLocation({
           vehicleId: navigationId,
           location: latestPosition,
+          convoyId: currentConvoyId,
+          status: convoyEmergencyActiveRef.current ? "sos" : "normal",
         });
+
         setSyncStatus("Live");
         setSyncError("");
       } catch (error) {
@@ -794,7 +2305,7 @@ function SafeRoutePlanner() {
     const timer = window.setInterval(syncLiveLocation, vehicleLiveLocationSyncMs);
 
     return () => window.clearInterval(timer);
-  }, [navigationId]);
+  }, [navigationId, routeKey, routeCoordinates]);
 
   useEffect(() => {
     if (
@@ -878,7 +2389,9 @@ function SafeRoutePlanner() {
 
       const candidatePromises = candidateBearings.map(async (bearing) => {
         const waypoint = getAvoidanceWaypoint(zoneToAvoid, bearing);
-        addAiDecisionLog(`Testing ${bearing}deg avoidance corridor outside ${Math.round(zoneToAvoid.radius)}m zone.`);
+        addAiDecisionLog(
+          `Testing ${bearing}deg avoidance corridor outside ${formatRadiusLabel(zoneToAvoid.radius)} zone.`
+        );
 
         const assessedRoutes = scoreCandidateRoutes(
           await computeRoutes({
@@ -901,7 +2414,9 @@ function SafeRoutePlanner() {
 
         if (viableRoute.touchesRisk) {
           addAiDecisionLog(
-            `Fallback ${bearing}deg corridor: best path still touches the active 2km zone, keeping as backup only.`
+            `Fallback ${bearing}deg corridor: best path still touches the active ${formatRadiusLabel(
+              zoneToAvoid.radius
+            )} zone, keeping as backup only.`
           );
         } else {
           addAiDecisionLog(
@@ -925,7 +2440,7 @@ function SafeRoutePlanner() {
         .sort((a, b) => a.score - b.score);
 
       if (!candidates.length) {
-        throw new Error("No safe alternate route found outside current 2km threat zones.");
+        throw new Error("No safe alternate route found outside current risk zones.");
       }
 
       return candidates[0];
@@ -939,7 +2454,23 @@ function SafeRoutePlanner() {
         const nextVehiclePosition = bestRoute.path[0] ?? rerouteOrigin;
 
         setRouteCoordinates(bestRoute.path);
-        setRouteSummary(formatRouteSummary(bestRoute.distanceMeters, bestRoute.durationSeconds));
+        const bestRouteSummary = formatRouteSummary(bestRoute.distanceMeters, bestRoute.durationSeconds);
+        setRouteSummary(bestRouteSummary);
+        setGeneratedRoutes([
+          {
+            label: "Route A",
+            path: bestRoute.path,
+            distanceText: bestRouteSummary.distanceText,
+            durationSeconds: bestRouteSummary.durationSeconds,
+            durationText: bestRouteSummary.durationText,
+          },
+        ]);
+        lastFuelStopsRouteKeyRef.current = "";
+        lastMovingFuelStopsRequestKeyRef.current = "";
+        setFuelStops([]);
+        setFuelStopsError("");
+        setFuelStopsLoading(false);
+        setRouteFuelPrices({});
         setRouteId(nextRouteId);
         setVehiclePosition(nextVehiclePosition);
         latestVehiclePositionRef.current = nextVehiclePosition;
@@ -954,7 +2485,9 @@ function SafeRoutePlanner() {
           )}min`
         );
         addAiDecisionLog(
-          `Committed a short traffic-aware reroute around ${threatDecisionLabel}, outside the active 2km risk radius.`
+          `Committed a short traffic-aware reroute around ${threatDecisionLabel}, outside the active ${formatRadiusLabel(
+            zoneToAvoid.radius
+          )} risk radius.`
         );
         if (navigationId) {
           void updateVehicleNavigationRoute({
@@ -994,17 +2527,15 @@ function SafeRoutePlanner() {
             const payload = (await response.json()) as { narration?: string };
             const rerouteBriefing =
               payload.narration ||
-              `Rerouting near ${threatLocationLabel}. ${zoneToAvoid.severity} risk reported within ${Math.round(
-                zoneToAvoid.radius / 1000
-              )} kilometers ahead.`;
+              `Rerouting near ${threatLocationLabel}. ${zoneToAvoid.severity} risk reported within ${formatRadiusLabel(
+                zoneToAvoid.radius
+              )} ahead.`;
             setDriverBriefing(rerouteBriefing);
             addAiDecisionLog(`Driver reroute advisory: ${rerouteBriefing}`);
-            speakText(rerouteBriefing, zoneToAvoid.id);
           })
           .catch(() => {
             const rerouteBriefing = `Rerouting near ${threatLocationLabel}. ${zoneToAvoid.severity} risk reported ahead.`;
             setDriverBriefing(rerouteBriefing);
-            speakText(rerouteBriefing, zoneToAvoid.id);
           });
         mapRef.current?.fitBounds(bounds, 72);
       })
@@ -1109,6 +2640,18 @@ function SafeRoutePlanner() {
     }
   }
 
+  function handleMapClick(event: google.maps.MapMouseEvent) {
+    if (!riskReportOpen || riskLocationSource !== "map" || !event.latLng) {
+      return;
+    }
+
+    setSelectedRiskLocation({
+      lat: event.latLng.lat(),
+      lng: event.latLng.lng(),
+    });
+    setRiskReportMessage("Report location selected.");
+  }
+
   function handlePlaceChanged(kind: "source" | "destination") {
     const autocomplete = kind === "source" ? sourceAutocompleteRef.current : destinationAutocompleteRef.current;
     const place = autocomplete?.getPlace();
@@ -1121,11 +2664,58 @@ function SafeRoutePlanner() {
     }
   }
 
-  async function triggerRiskEvent(eventType: RiskEvent) {
-    setRiskScore((currentScore) => Math.min(100, currentScore + riskEvents[eventType].increment));
-    addAiDecisionLog(`${riskEvents[eventType].label} captured for this vehicle.`);
+  function handleRiskLocationPlaceChanged() {
+    const place = riskLocationAutocompleteRef.current?.getPlace();
+    const value = place?.formatted_address || place?.name || "";
+    const location = place?.geometry?.location;
 
-    if (!navigationId || !displayedVehiclePosition || !routeKey) {
+    setRiskLocationQuery(value);
+
+    if (!location) {
+      setSelectedRiskLocation(null);
+      setRiskReportMessage("Choose a suggested location.");
+      return;
+    }
+
+    setSelectedRiskLocation({
+      lat: location.lat(),
+      lng: location.lng(),
+    });
+    setRiskReportMessage("Report location selected.");
+  }
+
+  async function submitRiskReport() {
+    const riskType = riskReportTypes[riskReportType];
+    const reportLocation =
+      riskLocationSource === "vehicle" ? displayedVehiclePosition : selectedRiskLocation;
+
+    if (riskLocationSource === "map" && !selectedRiskLocation) {
+      setRiskReportMessage("Select a location on the map.");
+      return;
+    }
+
+    if (riskLocationSource === "place" && !selectedRiskLocation) {
+      setRiskReportMessage("Choose a suggested location.");
+      return;
+    }
+
+    if (riskLocationSource === "vehicle" && !displayedVehiclePosition) {
+      setRiskReportMessage("Current vehicle location is not available.");
+      return;
+    }
+
+    if (riskLocationSource === "vehicle") {
+      setSelectedRiskLocation(null);
+    }
+
+    setRiskScore((currentScore) => Math.min(100, currentScore + riskReportIncrement));
+    setRiskReportMessage("Thanks for helping other drivers.");
+    setRiskReportOpen(false);
+    addAiDecisionLog(
+      `${riskType.label} risk report submitted${riskIssueDetails.trim() ? `: ${riskIssueDetails.trim()}` : "."}`
+    );
+
+    if (!navigationId || !reportLocation || !routeKey) {
       return;
     }
 
@@ -1135,12 +2725,62 @@ function SafeRoutePlanner() {
         routeKey,
         sourceLabel: source,
         destinationLabel: destination,
-        eventType: eventType as IncidentEventType,
-        lat: displayedVehiclePosition.lat,
-        lng: displayedVehiclePosition.lng,
+        eventType: riskType.eventType,
+        lat: reportLocation.lat,
+        lng: reportLocation.lng,
       });
     } catch (error) {
       setIncidentError(error instanceof Error ? error.message : "Unable to publish driver advisory.");
+    }
+  }
+
+  function getVerifiedThreatZone(zone: ThreatZone, vehicleId: string): ThreatZone {
+    const reports = zone.reports + 1;
+    const severity = getRiskZoneLevelFromReports(reports);
+
+    return {
+      ...zone,
+      confidence: getThreatConfidenceFromReports(reports),
+      reports,
+      radius: getRiskZoneRadiusMeters(severity),
+      severity,
+      verifiedBy: zone.verifiedBy.includes(vehicleId) ? zone.verifiedBy : [...zone.verifiedBy, vehicleId],
+    };
+  }
+
+  async function handleVerifyThreat(zone: ThreatZone) {
+    if (!navigationId) {
+      setThreatVerificationMessage("Start navigation to verify");
+      return;
+    }
+
+    if (zone.verifiedBy.includes(navigationId)) {
+      setThreatVerificationMessage("Already verified");
+      return;
+    }
+
+    const verifiedZone = getVerifiedThreatZone(zone, navigationId);
+
+    setVerifyingThreatId(zone.id);
+    setThreatVerificationMessage("");
+    setThreatZones((currentZones) =>
+      currentZones.map((currentZone) => (currentZone.id === zone.id ? verifiedZone : currentZone))
+    );
+    setThreatZone((currentZone) => (currentZone?.id === zone.id ? verifiedZone : currentZone));
+
+    try {
+      await verifyThreatZone(zone.id, navigationId);
+      setThreatZoneError("");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to verify threat.";
+      setThreatVerificationMessage(message === "Already verified" ? "Already verified" : "");
+      setThreatZoneError(message === "Already verified" ? "" : message);
+      setThreatZones((currentZones) =>
+        currentZones.map((currentZone) => (currentZone.id === zone.id ? zone : currentZone))
+      );
+      setThreatZone((currentZone) => (currentZone?.id === zone.id ? zone : currentZone));
+    } finally {
+      setVerifyingThreatId("");
     }
   }
 
@@ -1151,11 +2791,15 @@ function SafeRoutePlanner() {
     reroutedThreatZonesRef.current.clear();
     spokenIncidentIdsRef.current.clear();
     spokenThreatZoneIdsRef.current.clear();
+    spokenFuelStopIdsRef.current.clear();
+    convoyEmergencyActiveRef.current = false;
+    setConvoyEmergencyActive(false);
     window.speechSynthesis?.cancel();
     setStatus("idle");
     setMessage("Navigation stopped.");
     setRerouteStatus("");
     setRouteCoordinates([]);
+    setGeneratedRoutes([]);
     setRouteSummary(null);
     setRouteId("");
     setVehiclePosition(null);
@@ -1165,8 +2809,28 @@ function SafeRoutePlanner() {
     setVehicleStatus("Awaiting route");
     setNavigationId("");
     setRiskScore(0);
+    setRiskReportOpen(false);
+    setRiskReportMessage("");
+    setRiskIssueDetails("");
+    setRiskLocationQuery("");
+    setSelectedRiskLocation(null);
+    setRiskLocationSource("vehicle");
     setThreatZone(null);
+    setThreatVerificationMessage("");
     setDriverBriefing("No active advisories.");
+    setSafeStops([]);
+    setSafeStopsError("");
+    setSafeStopsLoading(false);
+    lastSafeStopsRequestKeyRef.current = "";
+    setFuelStops([]);
+    setFuelStopsError("");
+    setFuelStopsLoading(false);
+    setRouteFuelPrices({});
+    setCurrentDieselPrice(null);
+    lastFuelStopsRouteKeyRef.current = "";
+    lastMovingFuelStopsRequestKeyRef.current = "";
+    lastDieselGeoKeyRef.current = "";
+    lastDieselCityRef.current = "";
     setAiDecisionLogs(["Navigation stopped. Session document removed from Firestore."]);
     window.sessionStorage.removeItem(navigationSessionStorageKey);
     window.sessionStorage.removeItem(navigationStateStorageKey);
@@ -1200,8 +2864,31 @@ function SafeRoutePlanner() {
     threatZoneCreatedRef.current = false;
     spokenIncidentIdsRef.current.clear();
     spokenThreatZoneIdsRef.current.clear();
+    spokenFuelStopIdsRef.current.clear();
+    convoyEmergencyActiveRef.current = false;
+    setConvoyEmergencyActive(false);
     setRiskScore(0);
+    setRiskReportOpen(false);
+    setRiskReportMessage("");
+    setRiskIssueDetails("");
+    setRiskLocationQuery("");
+    setSelectedRiskLocation(null);
+    setRiskLocationSource("vehicle");
     setThreatZone(null);
+    setThreatVerificationMessage("");
+    setSafeStops([]);
+    setSafeStopsError("");
+    setSafeStopsLoading(false);
+    lastSafeStopsRequestKeyRef.current = "";
+    setFuelStops([]);
+    setFuelStopsError("");
+    setFuelStopsLoading(false);
+    setRouteFuelPrices({});
+    setCurrentDieselPrice(null);
+    lastFuelStopsRouteKeyRef.current = "";
+    lastMovingFuelStopsRequestKeyRef.current = "";
+    lastDieselGeoKeyRef.current = "";
+    lastDieselCityRef.current = "";
     setAiDecisionLogs(["Route intelligence initialized. Monitoring Firestore threat zones and traffic-aware alternatives."]);
     reroutedThreatZonesRef.current.clear();
     rerouteInFlightRef.current = false;
@@ -1215,7 +2902,7 @@ function SafeRoutePlanner() {
       const routes = await computeRoutes({
         origin: source,
         destination,
-        computeAlternativeRoutes: false,
+        computeAlternativeRoutes: true,
       });
       const primaryRoute = routes[0];
       const path = primaryRoute?.path;
@@ -1251,6 +2938,15 @@ function SafeRoutePlanner() {
       setNavigationId(nextNavigationId);
       setRouteCoordinates(path);
       setRouteSummary(primaryRoute.summary);
+      setGeneratedRoutes(
+        routes.map((route, index) => ({
+          label: `Route ${String.fromCharCode(65 + index)}`,
+          path: route.path,
+          distanceText: route.summary.distanceText,
+          durationSeconds: route.summary.durationSeconds,
+          durationText: route.summary.durationText,
+        }))
+      );
       setRouteId(nextRouteId);
       setStatus("success");
       setMessage("Route rendered correctly.");
@@ -1258,9 +2954,23 @@ function SafeRoutePlanner() {
       mapRef.current?.fitBounds(bounds, 72);
     } catch (error) {
       setRouteCoordinates([]);
+      setGeneratedRoutes([]);
       setRouteSummary(null);
       setRouteId("");
       setVehiclePosition(null);
+      setSafeStops([]);
+      setSafeStopsError("");
+      setSafeStopsLoading(false);
+      lastSafeStopsRequestKeyRef.current = "";
+      setFuelStops([]);
+      setFuelStopsError("");
+      setFuelStopsLoading(false);
+      setRouteFuelPrices({});
+      setCurrentDieselPrice(null);
+      lastFuelStopsRouteKeyRef.current = "";
+      lastMovingFuelStopsRequestKeyRef.current = "";
+      lastDieselGeoKeyRef.current = "";
+      lastDieselCityRef.current = "";
       latestVehiclePositionRef.current = null;
       vehicleIndexRef.current = 0;
       setVehicleIndex(0);
@@ -1291,18 +3001,41 @@ function SafeRoutePlanner() {
           zoom={routeCoordinates.length ? 11 : 5}
           options={mapOptions}
           onLoad={handleMapLoad}
+          onClick={handleMapClick}
         >
-          {routeCoordinates.length > 0 && (
+          {(generatedRoutes.length > 0 || routeCoordinates.length > 0) && (
             <>
-              <Polyline
-                path={routeCoordinates}
-                options={{
-                  strokeColor: rerouteStatus.includes("Optimized") ? "#22d3ee" : "#14b8a6",
-                  strokeOpacity: 0.92,
-                  strokeWeight: 6,
-                  zIndex: 20,
-                }}
-              />
+              {(generatedRoutes.length
+                ? generatedRoutes
+                : [
+                    {
+                      label: "Route A",
+                      path: routeCoordinates,
+                      distanceText: routeSummary?.distanceText ?? "No route",
+                      durationSeconds: routeSummary?.durationSeconds ?? 0,
+                      durationText: routeSummary?.durationText ?? "Awaiting route",
+                    },
+                  ]
+              ).map((route, index) => {
+                const isSelected = index === 0;
+
+                return (
+                  <Polyline
+                    key={route.label}
+                    path={route.path}
+                    options={{
+                      strokeColor: isSelected
+                        ? rerouteStatus.includes("Optimized")
+                          ? "#22d3ee"
+                          : "#14b8a6"
+                        : "#64748b",
+                      strokeOpacity: isSelected ? 0.95 : 0.48,
+                      strokeWeight: isSelected ? 6 : 4,
+                      zIndex: isSelected ? 24 : 18,
+                    }}
+                  />
+                );
+              })}
               <Marker position={routeCoordinates[0]} label="A" />
               <Marker position={routeCoordinates[routeCoordinates.length - 1]} label="B" />
             </>
@@ -1310,18 +3043,97 @@ function SafeRoutePlanner() {
 
           {displayedVehiclePosition && <Marker position={displayedVehiclePosition} icon={truckIcon} zIndex={40} />}
 
-          {threatZones.map((zone) => (
-            <Circle
-              key={zone.id}
-              center={zone.center}
-              radius={zone.radius}
+          {/* Convoy Partner Trucks and Tether Lines */}
+          {convoyModeActive && displayedVehiclePosition && fleetPartners.map((partner) => {
+            const partnerPos = { lat: partner.lat, lng: partner.lng };
+            const dist = getDistanceMeters(displayedVehiclePosition, partnerPos);
+            const isDistress = partner.status === "sos";
+            const tetherColor = isDistress 
+              ? "#ef4444" 
+              : dist <= 1500 
+                ? "#22d3ee" 
+                : dist <= 3000 
+                  ? "#fbbf24" 
+                  : "#ef4444";
+
+            return (
+              <Fragment key={partner.vehicleId}>
+                <Polyline
+                  path={[displayedVehiclePosition, partnerPos]}
+                  options={{
+                    strokeColor: tetherColor,
+                    strokeOpacity: 0.85,
+                    strokeWeight: 3,
+                    zIndex: 38,
+                    geodesic: true,
+                  }}
+                />
+                <Marker
+                  position={partnerPos}
+                  icon={getPartnerTruckIcon(partner.status)}
+                  zIndex={41}
+                  title={`Convoy Partner: ${partner.vehicleId}`}
+                />
+              </Fragment>
+            );
+          })}
+          {selectedRiskLocation && riskReportOpen && riskLocationSource !== "vehicle" && (
+            <Marker position={selectedRiskLocation} label="!" zIndex={45} />
+          )}
+
+          {threatZones.map((zone) => {
+            const zoneStyle = getRiskZoneStyle(getRiskZoneLevelFromConfidence(zone.confidence));
+
+            return (
+              <Fragment key={zone.id}>
+                <Circle
+                  center={zone.center}
+                  radius={zone.radius}
+                  options={{
+                    fillColor: zoneStyle.mapFill,
+                    fillOpacity: activeThreatZone?.id === zone.id ? 0.32 : 0.18,
+                    strokeColor: zoneStyle.mapStroke,
+                    strokeOpacity: activeThreatZone?.id === zone.id ? 1 : 0.75,
+                    strokeWeight: activeThreatZone?.id === zone.id ? 3 : 2,
+                    zIndex: 30,
+                  }}
+                />
+                <Marker
+                  position={zone.center}
+                  icon={getRiskZoneMarkerIcon(zoneStyle)}
+                  zIndex={activeThreatZone?.id === zone.id ? 46 : 35}
+                />
+              </Fragment>
+            );
+          })}
+
+          {shouldShowSafeStops && safeStops.map((stop) => (
+            <Marker
+              key={stop.id}
+              position={{ lat: stop.lat, lng: stop.lng }}
+              icon={getSafeStopMarkerIcon(stop.type)}
+              title={`${stop.name} - ${stop.type}`}
+              zIndex={38}
+            />
+          ))}
+
+          {fuelStops.map((stop) => (
+            <Marker
+              key={`fuel-${stop.id}`}
+              position={{ lat: stop.lat, lng: stop.lng }}
+              icon={getFuelStopMarkerIcon()}
+              label={{
+                text: typeof stop.dieselPrice === "number" ? `Rs ${Math.round(stop.dieselPrice)}` : "D",
+                color: "#15803d",
+                fontSize: "10px",
+                fontWeight: "800",
+              }}
+              title={`${stop.name} - diesel ${
+                typeof stop.dieselPrice === "number" ? `Rs ${stop.dieselPrice.toFixed(2)}/L` : "price loading"
+              }`}
               options={{
-                fillColor: "#ef4444",
-                fillOpacity: activeThreatZone?.id === zone.id ? 0.32 : 0.18,
-                strokeColor: "#f87171",
-                strokeOpacity: activeThreatZone?.id === zone.id ? 1 : 0.75,
-                strokeWeight: activeThreatZone?.id === zone.id ? 3 : 2,
-                zIndex: 30,
+                optimized: false,
+                zIndex: 42,
               }}
             />
           ))}
@@ -1330,9 +3142,17 @@ function SafeRoutePlanner() {
 
       {activeThreatZone && (
         <section className="pointer-events-none absolute inset-x-0 top-[27rem] z-20 px-4 sm:inset-x-auto sm:left-5 sm:top-[430px] sm:w-[420px] sm:p-0">
-          <div className="animate-pulse rounded-lg border border-red-300/50 bg-red-500/20 p-4 shadow-2xl shadow-red-950/40 backdrop-blur-2xl">
+          <div
+            className={`rounded-lg border p-4 shadow-2xl shadow-slate-900/25 backdrop-blur-2xl ${
+              activeRiskZoneStyle?.cardClassName ?? "border-red-300 bg-red-50"
+            }`}
+          >
             <div className="flex items-center gap-3">
-              <span className="flex h-10 w-10 items-center justify-center rounded border border-red-200/40 bg-red-300/20 text-red-100">
+              <span
+                className={`flex h-10 w-10 items-center justify-center rounded border ${
+                  activeRiskZoneStyle?.iconClassName ?? "border-red-200 bg-red-50 text-red-600"
+                }`}
+              >
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
                   <path d="M12 9v4" />
@@ -1340,10 +3160,39 @@ function SafeRoutePlanner() {
                 </svg>
               </span>
               <div>
-                <p className="text-sm font-semibold text-red-50">High Risk Zone Ahead</p>
-                <p className="mt-1 text-xs text-red-100/80">
-                  {activeThreatZone.severity.toUpperCase()} threat within {Math.round(activeThreatZone.radius / 1000)}km radius
+                <p className="text-sm font-semibold text-slate-900">
+                  {activeRiskZoneStyle?.label ?? "High Risk"} Zone Ahead
                 </p>
+                <p className="mt-1 text-xs text-slate-600">
+                  {activeRiskZoneStyle?.label ?? "High Risk"} within {formatRadiusLabel(activeThreatZone.radius)} radius
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                  <span className="font-semibold text-slate-700">Confidence: {activeThreatZone.confidence}%</span>
+                  <span className={`rounded border px-2 py-0.5 font-semibold ${activeThreatConfidence?.className}`}>
+                    {activeThreatConfidence?.label}
+                  </span>
+                  <span
+                    className={`rounded border px-2 py-0.5 font-semibold ${
+                      activeRiskZoneStyle?.badgeClassName ?? "border-red-200 bg-white text-red-700"
+                    }`}
+                  >
+                    {activeRiskZoneStyle?.label ?? "High Risk"}
+                  </span>
+                </div>
+                <p className="mt-1 text-xs font-medium text-slate-500">Verified Reports: {activeThreatZone.reports}</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleVerifyThreat(activeThreatZone);
+                  }}
+                  disabled={verifyingThreatId === activeThreatZone.id}
+                  className="pointer-events-auto mt-3 h-9 rounded border border-sky-200 bg-sky-50 px-3 text-xs font-semibold text-sky-700 transition hover:border-sky-300 hover:bg-sky-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+                >
+                  {verifyingThreatId === activeThreatZone.id ? "Verifying..." : "Verify Threat"}
+                </button>
+                {threatVerificationMessage && (
+                  <p className="mt-2 text-xs font-semibold text-slate-600">{threatVerificationMessage}</p>
+                )}
               </div>
             </div>
           </div>
@@ -1500,6 +3349,188 @@ function SafeRoutePlanner() {
                       <p className="mt-1 text-sm font-semibold text-slate-900">{routeMeta.coordinateCount}</p>
                     </div>
                   </div>
+
+                  {routeRiskSummaries.length > 0 && (
+                    <div className="space-y-2">
+                      {routeRiskSummaries.map((route) => {
+                        const isRecommended = route.label === recommendedRouteLabel;
+                        const isSelected = route.label === selectedRouteLabel;
+
+                        return (
+                          <div
+                            key={route.label}
+                            className={`rounded-xl border px-3 py-2 text-xs ${
+                              isSelected
+                                ? "border-teal-300 bg-teal-50 text-slate-700 shadow-sm"
+                                : "border-slate-200 bg-white text-slate-600"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="font-semibold text-slate-900">Route ID: {route.label}</span>
+                              <span>ETA: {route.eta}</span>
+                            </div>
+                            <div className="mt-1 font-medium text-slate-600">Distance: {route.distance}</div>
+                            <div className="mt-1 flex flex-wrap items-center gap-2 font-semibold text-slate-700">
+                              <span>Risk: {route.risk}</span>
+                              <span className={`rounded border px-2 py-0.5 ${route.riskCategory.className}`}>
+                                {route.riskCategory.label}
+                              </span>
+                              {typeof route.dieselPrice === "number" && (
+                                <span className="rounded border border-green-200 bg-green-50 px-2 py-0.5 text-green-700">
+                                  Diesel: Rs {route.dieselPrice.toFixed(2)}/L
+                                  {route.dieselCity ? ` - ${route.dieselCity}` : ""}
+                                </span>
+                              )}
+                              {isSelected && (
+                                <span className="rounded border border-teal-200 bg-white px-2 py-0.5 text-teal-700">
+                                  Default Selected
+                                </span>
+                              )}
+                              {isRecommended && (
+                                <span className="rounded border border-sky-200 bg-white px-2 py-0.5 text-sky-700">
+                                  Recommended Route
+                                </span>
+                              )}
+                              {isRecommended && typeof route.dieselPrice === "number" && (
+                                <span className="rounded border border-green-200 bg-white px-2 py-0.5 text-green-700">
+                                  Fuel Efficient
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Virtual Security Convoy Card */}
+            <div className="rounded-2xl border border-slate-200 bg-white/80 p-3">
+              <button
+                type="button"
+                onClick={() => setConvoyOpen((isOpen) => !isOpen)}
+                className="flex w-full items-center justify-between gap-3 text-left"
+              >
+                <span>
+                  <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">
+                    Virtual Security Convoy
+                  </span>
+                  <span className="mt-1 block text-sm font-semibold text-slate-900">
+                    Dynamic fleet safety matching
+                  </span>
+                </span>
+                <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-sky-700">
+                  {convoyOpen ? "Hide" : "Open"}
+                </span>
+              </button>
+
+              {convoyOpen && (
+                <div className="mt-3 space-y-3">
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/50 p-2.5">
+                    <span className="text-xs font-semibold text-slate-700">Convoy Safety System</span>
+                    <button
+                      type="button"
+                      onClick={() => setConvoyModeActive(!convoyModeActive)}
+                      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                        convoyModeActive ? "bg-sky-600" : "bg-slate-200"
+                      }`}
+                    >
+                      <span
+                        className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                          convoyModeActive ? "translate-x-5" : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {convoyModeActive && (
+                    <div className="space-y-3 rounded-xl border border-slate-100 bg-slate-50/30 p-2.5 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleConvoySosToggle();
+                        }}
+                        disabled={!navigationId || !displayedVehiclePosition}
+                        className={`flex h-10 w-full items-center justify-center gap-2 rounded-xl border px-3 text-xs font-bold uppercase transition disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400 ${
+                          convoyEmergencyActive
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                            : "border-rose-300 bg-rose-600 text-white shadow-sm shadow-rose-600/20 hover:bg-rose-500"
+                        }`}
+                      >
+                        {convoyEmergencyActive ? "Resolve SOS Alarm" : "SOS Alarm"}
+                      </button>
+
+                      {fleetPartners.length === 0 ? (
+                        <div className="flex items-center justify-center gap-2 py-3 text-slate-500">
+                          <svg className="h-4 w-4 animate-spin text-sky-600" viewBox="0 0 24 24" fill="none">
+                            <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                            <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                          </svg>
+                          <span>Awaiting fleet partners...</span>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="space-y-2">
+                            <p className="font-semibold text-slate-700">Active Convoy Members</p>
+                            {fleetPartners.map((partner) => {
+                              const partnerPos = { lat: partner.lat, lng: partner.lng };
+                              const partnerDist = displayedVehiclePosition 
+                                ? getDistanceMeters(displayedVehiclePosition, partnerPos) 
+                                : 0;
+                              const isAtRisk = partner.status === "sos";
+
+                              return (
+                                <div
+                                  key={partner.vehicleId}
+                                  className="flex items-center justify-between gap-3 border-b border-slate-100 pb-2 last:border-0 last:pb-0"
+                                >
+                                  <div>
+                                    <span className="font-bold text-slate-800">
+                                      {partner.vehicleId.includes("_partner") ? "Truck Beta (Partner)" : partner.vehicleId.slice(0, 12)}
+                                    </span>
+                                    <span className="ml-2 text-slate-500">({Math.round(partnerDist)}m away)</span>
+                                  </div>
+                                  <span
+                                    className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase ${
+                                      isAtRisk
+                                        ? "bg-rose-100 text-rose-700 border border-rose-200"
+                                        : "bg-emerald-100 text-emerald-700 border border-emerald-200"
+                                    }`}
+                                  >
+                                    {isAtRisk ? "At Risk" : "Secure"}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          <div className="border-t border-slate-100 pt-2.5">
+                            <div className="flex items-center justify-between">
+                              <span className="font-semibold text-slate-600">Wireless Safety Tether:</span>
+                              {(() => {
+                                const hasDistress = convoyEmergencyActive || fleetPartners.some(p => p.status === "sos");
+
+                                if (hasDistress) {
+                                  return (
+                                    <span className="rounded bg-rose-500 px-2 py-0.5 font-bold text-white uppercase animate-pulse">
+                                      At Risk
+                                    </span>
+                                  );
+                                }
+                                return (
+                                  <span className="rounded bg-cyan-100 border border-cyan-200 px-2 py-0.5 font-bold text-cyan-700 uppercase">
+                                    Secure
+                                  </span>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -1541,7 +3572,7 @@ function SafeRoutePlanner() {
                     >
                       {availableVoiceLanguages.map((language) => (
                         <option key={language} value={language}>
-                          {language}
+                          {getVoiceLanguageLabel(language)}
                         </option>
                       ))}
                     </select>
@@ -1551,6 +3582,172 @@ function SafeRoutePlanner() {
               )}
             </div>
 
+            {navigationId && (
+              <div className="rounded-2xl border border-green-200 bg-white/85 p-3">
+                <button
+                  type="button"
+                  onClick={() => setFuelStopsOpen((isOpen) => !isOpen)}
+                  className="flex w-full items-center justify-between gap-3 text-left"
+                >
+                  <span>
+                    <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-green-700/80">
+                      Diesel
+                    </span>
+                    <span className="mt-1 block text-sm font-semibold text-slate-900">
+                      Fuel stops on route
+                    </span>
+                  </span>
+                  <div className="flex items-center gap-2">
+                    {currentDieselPrice && (
+                      <span className="rounded border border-green-200 bg-green-50 px-2 py-1 text-xs font-semibold text-green-700">
+                        Rs {currentDieselPrice.dieselPrice.toFixed(2)}/L
+                      </span>
+                    )}
+                    <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-green-700">
+                      {fuelStopsOpen ? "Hide" : "Open"}
+                    </span>
+                  </div>
+                </button>
+
+                {fuelStopsOpen && (
+                  <div className="mt-3">
+                    {fuelStopsLoading && (
+                      <div className="flex items-center gap-2 rounded-xl border border-green-100 bg-green-50 px-3 py-2 text-xs font-medium text-green-700">
+                        <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                          <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                        </svg>
+                        Finding diesel stops on this route
+                      </div>
+                    )}
+
+                    {!fuelStopsLoading && fuelStopsError && (
+                      <p className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+                        {fuelStopsError}
+                      </p>
+                    )}
+
+                    {!fuelStopsLoading && !fuelStopsError && fuelStops.length === 0 && (
+                      <p className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-600">
+                        No diesel stops found on this route.
+                      </p>
+                    )}
+
+                    {!fuelStopsLoading && !fuelStopsError && fuelStops.length > 0 && (
+                      <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
+                        {fuelStops.map((stop) => (
+                          <div
+                            key={stop.id}
+                            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="truncate font-semibold text-slate-900">{stop.name}</p>
+                                <p className="mt-1 font-medium text-green-700">
+                                  {stop.city
+                                    ? `Price area: ${stop.city}`
+                                    : stop.priceUnavailable
+                                      ? "Diesel price unavailable"
+                                      : "Checking diesel price"}
+                                </p>
+                              </div>
+                              <span className="shrink-0 rounded border border-green-200 bg-green-50 px-2 py-0.5 font-semibold text-green-700">
+                                {typeof stop.dieselPrice === "number"
+                                  ? `Rs ${stop.dieselPrice.toFixed(2)}/L`
+                                  : stop.priceUnavailable
+                                    ? "No price"
+                                    : formatSafeStopDistance(stop.distanceMeters)}
+                              </span>
+                            </div>
+                            <p className="mt-1 text-slate-500">
+                              Route distance: {formatSafeStopDistance(stop.distanceMeters)}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {shouldShowSafeStops && (
+              <div className="rounded-2xl border border-emerald-200 bg-white/85 p-3">
+                <button
+                  type="button"
+                  onClick={() => setSafeStopsOpen((isOpen) => !isOpen)}
+                  className="flex w-full items-center justify-between gap-3 text-left"
+                >
+                  <span>
+                    <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-emerald-700/80">
+                      Safe Stops
+                    </span>
+                    <span className="mt-1 block text-sm font-semibold text-slate-900">
+                      Nearby driver options
+                    </span>
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700">
+                      {safeStopsLoading ? "..." : safeStops.length}
+                    </span>
+                    <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-emerald-700">
+                      {safeStopsOpen ? "Hide" : "Open"}
+                    </span>
+                  </div>
+                </button>
+
+                {safeStopsOpen && (
+                  <div className="mt-3">
+                    {safeStopsLoading && (
+                      <div className="flex items-center gap-2 rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700">
+                        <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                          <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                        </svg>
+                        Finding safe stops within 5 km
+                      </div>
+                    )}
+
+                    {!safeStopsLoading && safeStopsError && (
+                      <p className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+                        {safeStopsError}
+                      </p>
+                    )}
+
+                    {!safeStopsLoading && !safeStopsError && safeStops.length === 0 && (
+                      <p className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-600">
+                        No safe stops found nearby.
+                      </p>
+                    )}
+
+                    {!safeStopsLoading && !safeStopsError && safeStops.length > 0 && (
+                      <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
+                        {safeStops.map((stop) => (
+                          <div
+                            key={stop.id}
+                            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="truncate font-semibold text-slate-900">{stop.name}</p>
+                                <p className="mt-1 font-medium text-emerald-700">{stop.type}</p>
+                              </div>
+                              <span className="shrink-0 rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 font-semibold text-emerald-700">
+                                {formatSafeStopDistance(stop.distanceMeters)}
+                              </span>
+                            </div>
+                            {typeof stop.rating === "number" && (
+                              <p className="mt-1 text-slate-500">Rating: {stop.rating.toFixed(1)}</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="rounded-2xl border border-slate-200 bg-white/80 p-3">
               <button
                 type="button"
@@ -1559,10 +3756,9 @@ function SafeRoutePlanner() {
               >
                 <span>
                   <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-sky-700/80">Risk</span>
-                  <span className="mt-1 block text-sm font-semibold text-slate-900">Event Monitor</span>
+                  <span className="mt-1 block text-sm font-semibold text-slate-900">Event Report</span>
                 </span>
                 <div className="flex items-center gap-2">
-                  <span className={`rounded px-2 py-1 text-xs font-semibold ${riskColor}`}>{riskScore}/100</span>
                   <span className="rounded-xl border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-sky-700">
                     {riskOpen ? "Hide" : "Open"}
                   </span>
@@ -1571,32 +3767,185 @@ function SafeRoutePlanner() {
 
               {riskOpen && (
                 <div className="mt-3">
-                  <div className="h-2 overflow-hidden rounded-full bg-slate-200">
-                    <div
-                      className={`h-full rounded-full transition-all duration-300 ${riskTrackColor}`}
-                      style={{ width: `${riskScore}%` }}
-                    />
-                  </div>
+                  <div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRiskReportOpen((isOpen) => !isOpen);
+                        setRiskReportMessage("");
+                      }}
+                      className="flex h-10 w-full items-center justify-center rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:border-sky-300 hover:bg-sky-50"
+                    >
+                      + Add Risk Report
+                    </button>
 
-                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-                    {(Object.keys(riskEvents) as RiskEvent[]).map((eventType) => (
+                    {riskReportOpen && (
+                      <div className="mt-3 space-y-3 rounded-xl border border-slate-200 bg-white p-3">
+                        <label className="block">
+                          <span className="mb-1.5 block text-[11px] font-medium text-slate-500">Risk Type</span>
+                          <select
+                            value={riskReportType}
+                            onChange={(event) => setRiskReportType(event.target.value as RiskReportType)}
+                            className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-400"
+                          >
+                            {(Object.keys(riskReportTypes) as RiskReportType[]).map((type) => (
+                              <option key={type} value={type}>
+                                {riskReportTypes[type].label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+
+                        <label className="block">
+                          <span className="mb-1.5 block text-[11px] font-medium text-slate-500">Issue Details</span>
+                          <textarea
+                            value={riskIssueDetails}
+                            onChange={(event) => setRiskIssueDetails(event.target.value)}
+                            placeholder="Type the issue manually"
+                            rows={3}
+                            className="w-full resize-none rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none placeholder:text-slate-400 focus:border-sky-400"
+                          />
+                        </label>
+
+                        <div>
+                          <span className="mb-1.5 block text-[11px] font-medium text-slate-500">Location Source</span>
+                          <div className="grid grid-cols-1 gap-2">
+                            <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                              <input
+                                type="radio"
+                                name="risk-location-source"
+                                checked={riskLocationSource === "vehicle"}
+                                onChange={() => {
+                                  setRiskLocationSource("vehicle");
+                                  setSelectedRiskLocation(null);
+                                  setRiskReportMessage("");
+                                }}
+                                className="h-4 w-4 border-slate-300 text-sky-600 focus:ring-sky-500"
+                              />
+                              Use Current Vehicle Location
+                            </label>
+                            <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                              <input
+                                type="radio"
+                                name="risk-location-source"
+                                checked={riskLocationSource === "map"}
+                                onChange={() => {
+                                  setRiskLocationSource("map");
+                                  setSelectedRiskLocation(null);
+                                  setRiskReportMessage("Select a location on the map.");
+                                }}
+                                className="h-4 w-4 border-slate-300 text-sky-600 focus:ring-sky-500"
+                              />
+                              Select Location On Map
+                            </label>
+                            <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                              <input
+                                type="radio"
+                                name="risk-location-source"
+                                checked={riskLocationSource === "place"}
+                                onChange={() => {
+                                  setRiskLocationSource("place");
+                                  setSelectedRiskLocation(null);
+                                  setRiskReportMessage("");
+                                }}
+                                className="h-4 w-4 border-slate-300 text-sky-600 focus:ring-sky-500"
+                              />
+                              Type Location Name
+                            </label>
+                          </div>
+                        </div>
+
+                        {riskLocationSource === "place" && (
+                          <label className="block">
+                            <span className="mb-1.5 block text-[11px] font-medium text-slate-500">Location Name</span>
+                            {isLoaded ? (
+                              <Autocomplete
+                                onLoad={(autocomplete) => {
+                                  riskLocationAutocompleteRef.current = autocomplete;
+                                }}
+                                onPlaceChanged={handleRiskLocationPlaceChanged}
+                              >
+                                <input
+                                  value={riskLocationQuery}
+                                  onChange={(event) => {
+                                    setRiskLocationQuery(event.target.value);
+                                    setSelectedRiskLocation(null);
+                                  }}
+                                  placeholder="Search risk location"
+                                  className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none placeholder:text-slate-400 focus:border-sky-400"
+                                />
+                              </Autocomplete>
+                            ) : (
+                              <input
+                                disabled
+                                placeholder="Loading Places..."
+                                className="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-400"
+                              />
+                            )}
+                          </label>
+                        )}
+
+                        {riskLocationSource === "map" && selectedRiskLocation && (
+                          <p className="text-xs text-slate-500">
+                            Selected: {selectedRiskLocation.lat.toFixed(4)}, {selectedRiskLocation.lng.toFixed(4)}
+                          </p>
+                        )}
+                        {riskLocationSource === "map" && (
+                          <p className="text-xs text-slate-500">
+                            {selectedRiskLocation
+                              ? "Click another point on the map to change this location."
+                              : "Click a point on the map to place the report marker."}
+                          </p>
+                        )}
+                        {riskLocationSource === "place" && selectedRiskLocation && (
+                          <p className="text-xs text-slate-500">
+                            Selected: {selectedRiskLocation.lat.toFixed(4)}, {selectedRiskLocation.lng.toFixed(4)}
+                          </p>
+                        )}
+
                       <button
-                        key={eventType}
                         type="button"
                         onClick={() => {
-                          void triggerRiskEvent(eventType);
+                          void submitRiskReport();
                         }}
-                        className="min-h-9 rounded-xl border border-slate-200 bg-white px-2 py-2 text-xs font-medium text-slate-700 transition hover:border-sky-300 hover:bg-sky-50"
+                          className="h-10 w-full rounded-xl bg-sky-600 px-3 text-sm font-semibold text-white transition hover:bg-sky-500"
                       >
-                        {riskEvents[eventType].label}
+                          Submit Report
                       </button>
-                    ))}
+                      </div>
+                    )}
+
+                    {riskReportMessage && <p className="mt-2 text-xs text-slate-600">{riskReportMessage}</p>}
                   </div>
 
-                  <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                    {threatZone
-                      ? `${threatZone.severity.toUpperCase()} zone: 2km radius`
-                      : threatZoneStatus || "Threat zone triggers above 60 risk."}
+                  <div
+                    className={`mt-3 rounded-xl border p-3 text-xs text-slate-600 ${
+                      currentRiskZoneStyle?.cardClassName ?? "border-slate-200 bg-slate-50"
+                    }`}
+                  >
+                    {threatZone ? (
+                      <>
+                        <div className="font-semibold text-slate-800">
+                          {currentRiskZoneStyle?.label ?? "High Risk"} zone: {formatRadiusLabel(threatZone.radius)} radius
+                        </div>
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <span>Confidence: {threatZone.confidence}%</span>
+                          <span className={`rounded border px-2 py-0.5 font-semibold ${currentThreatConfidence?.className}`}>
+                            {currentThreatConfidence?.label}
+                          </span>
+                          <span
+                            className={`rounded border px-2 py-0.5 font-semibold ${
+                              currentRiskZoneStyle?.badgeClassName ?? "border-red-200 bg-white text-red-700"
+                            }`}
+                          >
+                            {currentRiskZoneStyle?.label ?? "High Risk"}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-slate-500">Verified Reports: {threatZone.reports}</div>
+                      </>
+                    ) : (
+                      threatZoneStatus || "Risk zone triggers above 60 risk."
+                    )}
                     {threatZoneError && <div className="mt-1 break-words text-rose-600">{threatZoneError}</div>}
                   </div>
                 </div>

@@ -8,10 +8,54 @@ import {
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
+  where,
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
+
+const defaultThreatConfidence = 35;
+const defaultThreatReports = 1;
+const defaultThreatRadiusMeters = 1000;
+
+function getThreatLevelFromReports(reports: number) {
+  if (reports <= 2) {
+    return "low";
+  }
+
+  if (reports < 5) {
+    return "medium";
+  }
+
+  return "high";
+}
+
+function getThreatConfidenceFromReports(reports: number) {
+  const level = getThreatLevelFromReports(reports);
+
+  if (level === "low") {
+    return 25;
+  }
+
+  if (level === "medium") {
+    return 60;
+  }
+
+  return 85;
+}
+
+function getThreatRadiusFromLevel(level: string) {
+  if (level === "low") {
+    return 300;
+  }
+
+  if (level === "medium") {
+    return 700;
+  }
+
+  return defaultThreatRadiusMeters;
+}
 
 export type VehicleLocation = {
   lat: number;
@@ -22,19 +66,28 @@ export type TrackedVehicle = {
   vehicleId: string;
   lat: number;
   lng: number;
+  status: string;
+  convoyId: string | null;
 };
 
 export type ThreatZoneInput = {
   lat: number;
   lng: number;
-  radius: number;
+  radius?: number;
   severity: string;
+  confidence?: number;
+  reports?: number;
+  verifiedBy?: string[];
   sourceVehicleId?: string;
   routeKey?: string;
 };
 
-export type ThreatZoneRecord = ThreatZoneInput & {
+export type ThreatZoneRecord = Omit<ThreatZoneInput, "radius" | "confidence" | "reports" | "verifiedBy"> & {
   id: string;
+  radius: number;
+  confidence: number;
+  reports: number;
+  verifiedBy: string[];
   timestamp: Timestamp | null;
 };
 
@@ -83,17 +136,55 @@ export async function writeTestDocument(): Promise<string> {
 export async function updateVehicleLiveLocation({
   vehicleId,
   location,
+  convoyId,
+  status,
 }: {
   vehicleId: string;
   location: VehicleLocation;
+  convoyId?: string | null;
+  status?: string;
 }) {
   await setDoc(
     doc(db, "vehicles", vehicleId),
     {
       lat: location.lat,
       lng: location.lng,
+      ...(convoyId !== undefined ? { convoyId } : {}),
+      ...(status !== undefined ? { status } : {}),
     },
     { merge: true }
+  );
+}
+
+export function subscribeToConvoyVehicles(
+  convoyId: string,
+  onVehiclesChange: (vehicles: TrackedVehicle[]) => void,
+  onError?: (error: Error) => void
+) {
+  return onSnapshot(
+    query(collection(db, "vehicles"), where("convoyId", "==", convoyId)),
+    (snapshot) => {
+      const vehicles = snapshot.docs
+        .map((vehicleDoc): TrackedVehicle | null => {
+          const data = vehicleDoc.data();
+          if (typeof data.lat !== "number" || typeof data.lng !== "number") {
+            return null;
+          }
+          return {
+            vehicleId: vehicleDoc.id,
+            lat: data.lat,
+            lng: data.lng,
+            status: typeof data.status === "string" ? data.status : "normal",
+            convoyId: typeof data.convoyId === "string" ? data.convoyId : convoyId,
+          };
+        })
+        .filter((v): v is TrackedVehicle => v !== null);
+
+      onVehiclesChange(vehicles);
+    },
+    (error) => {
+      onError?.(error);
+    }
   );
 }
 
@@ -157,6 +248,8 @@ export function subscribeToVehicle(
         vehicleId: typeof data.vehicleId === "string" ? data.vehicleId : vehicleId,
         lat,
         lng,
+        status: typeof data.status === "string" ? data.status : "normal",
+        convoyId: typeof data.convoyId === "string" ? data.convoyId : null,
       });
     },
     (error) => {
@@ -170,16 +263,23 @@ export async function createThreatZone({
   lng,
   radius,
   severity,
+  confidence,
+  reports,
+  verifiedBy,
   sourceVehicleId,
   routeKey,
 }: ThreatZoneInput) {
   const threatZonesCollection = collection(db, "threatZones");
+  const reportCount = reports ?? defaultThreatReports;
 
   const docRef = await addDoc(threatZonesCollection, {
     lat,
     lng,
-    radius,
+    radius: radius ?? defaultThreatRadiusMeters,
     severity,
+    confidence: confidence ?? getThreatConfidenceFromReports(reportCount),
+    reports: reportCount,
+    verifiedBy: verifiedBy ?? (sourceVehicleId ? [sourceVehicleId] : []),
     sourceVehicleId: sourceVehicleId ?? null,
     routeKey: routeKey ?? null,
     timestamp: serverTimestamp(),
@@ -201,8 +301,7 @@ export function subscribeToThreatZones(
 
           if (
             typeof data.lat !== "number" ||
-            typeof data.lng !== "number" ||
-            typeof data.radius !== "number"
+            typeof data.lng !== "number"
           ) {
             return null;
           }
@@ -211,8 +310,13 @@ export function subscribeToThreatZones(
             id: threatZoneDoc.id,
             lat: data.lat,
             lng: data.lng,
-            radius: data.radius,
-            severity: typeof data.severity === "string" ? data.severity : "high",
+            radius: typeof data.radius === "number" ? data.radius : defaultThreatRadiusMeters,
+            severity: typeof data.severity === "string" ? data.severity : "unknown",
+            confidence: typeof data.confidence === "number" ? data.confidence : defaultThreatConfidence,
+            reports: typeof data.reports === "number" ? data.reports : defaultThreatReports,
+            verifiedBy: Array.isArray(data.verifiedBy)
+              ? data.verifiedBy.filter((vehicleId): vehicleId is string => typeof vehicleId === "string")
+              : [],
             ...(typeof data.sourceVehicleId === "string"
               ? { sourceVehicleId: data.sourceVehicleId }
               : {}),
@@ -228,6 +332,39 @@ export function subscribeToThreatZones(
       onError?.(error);
     }
   );
+}
+
+export async function verifyThreatZone(threatZoneId: string, vehicleId: string) {
+  const threatZoneRef = doc(db, "threatZones", threatZoneId);
+
+  await runTransaction(db, async (transaction) => {
+    const threatZoneSnapshot = await transaction.get(threatZoneRef);
+
+    if (!threatZoneSnapshot.exists()) {
+      throw new Error("Threat zone no longer exists.");
+    }
+
+    const data = threatZoneSnapshot.data();
+    const currentReports = typeof data.reports === "number" ? data.reports : defaultThreatReports;
+    const nextReports = currentReports + 1;
+    const nextSeverity = getThreatLevelFromReports(nextReports);
+    const nextConfidence = getThreatConfidenceFromReports(nextReports);
+    const verifiedBy = Array.isArray(data.verifiedBy)
+      ? data.verifiedBy.filter((verifiedVehicleId): verifiedVehicleId is string => typeof verifiedVehicleId === "string")
+      : [];
+
+    if (verifiedBy.includes(vehicleId)) {
+      throw new Error("Already verified");
+    }
+
+    transaction.update(threatZoneRef, {
+      confidence: nextConfidence,
+      reports: nextReports,
+      severity: nextSeverity,
+      radius: getThreatRadiusFromLevel(nextSeverity),
+      verifiedBy: [...verifiedBy, vehicleId],
+    });
+  });
 }
 
 export async function createIncidentMessage({

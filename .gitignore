@@ -3,13 +3,14 @@ node_modules/
 .pnp
 .pnp.js
 .pnpm-store/
-
+firebase-debug.log
 # Build output
 .next/
 out/
 build/
 dist/
-
+apphosting.yaml
+firebase.json
 # Environment variables — NEVER commit these
 .env
 .env.local
